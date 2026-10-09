@@ -1,0 +1,71 @@
+id: tag_pie_decoder
+label: Tag PIE Decoder
+category: '[Backscatter Framework]'
+
+parameters:
+-   id: bit_rate
+    label: bit_rate
+    dtype: real
+    default: 10e3
+    hide: none
+-   id: enable_mac
+    label: enable_mac
+    dtype: int
+    default: '1'
+    hide: none
+-   id: packet_bits
+    label: packet_bits
+    dtype: real
+    default: '16'
+    hide: none
+-   id: samp_rate
+    label: samp_rate
+    dtype: real
+    default: 2e6
+    hide: none
+-   id: slot_id
+    label: slot_id
+    dtype: int
+    default: '0'
+    hide: none
+-   id: tari
+    label: Tari
+    dtype: real
+    default: '12.5'
+    hide: none
+-   id: threshold
+    label: threshold
+    dtype: real
+    default: '0.6'
+    hide: none
+
+inputs:
+-   label: rf_in
+    dtype: complex
+    vlen: 1
+
+outputs:
+-   label: cmd_out
+    dtype: float
+    vlen: 1
+
+templates:
+    imports: 'from tag_pie_decoder import tag_pie_decoder  # grc-generated hier_block'
+    make: "tag_pie_decoder(\n    bit_rate=${ bit_rate },\n    enable_mac=${ enable_mac\
+        \ },\n    packet_bits=${ packet_bits },\n    samp_rate=${ samp_rate },\n \
+        \   slot_id=${ slot_id },\n    tari=${ tari },\n    threshold=${ threshold\
+        \ },\n)"
+    callbacks:
+    - set_bit_rate(${ bit_rate })
+    - set_enable_mac(${ enable_mac })
+    - set_packet_bits(${ packet_bits })
+    - set_samp_rate(${ samp_rate })
+    - set_slot_id(${ slot_id })
+    - set_tari(${ tari })
+    - set_threshold(${ threshold })
+
+documentation: /home/geethikap/.local/state/gnuradio/tag_pie_decoder.py
+grc_source: /media/Others/Documents/Research_Asst_Materials/GNU RADIO COMPANION/Hier
+    Blocks/tag_pie_decoder.grc
+
+file_format: 1

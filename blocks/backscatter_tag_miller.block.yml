@@ -1,0 +1,126 @@
+id: backscatter_tag_miller
+label: Tag_Miller (Backscatter)
+category: '[Backscatter Framework]'
+
+parameters:
+-   id: alpha
+    label: Alpha Factor
+    dtype: real
+    default: '0.01'
+    hide: none
+-   id: as_imag
+    label: Structural Scattering Imag
+    dtype: real
+    default: '0.02'
+    hide: none
+-   id: as_real
+    label: Structural Scattering Real
+    dtype: real
+    default: '0.05'
+    hide: none
+-   id: bit_rate
+    label: bit_rate
+    dtype: real
+    default: 10e3
+    hide: none
+-   id: enable_gated
+    label: Gated Mode
+    dtype: int
+    default: '1'
+    hide: none
+-   id: gamma0_mag
+    label: Gamma 0 Magnitude
+    dtype: real
+    default: '0.2'
+    hide: none
+-   id: gamma0_phase_deg
+    label: Gamma 0 Phase
+    dtype: real
+    default: '15.0'
+    hide: none
+-   id: gamma1_mag
+    label: Gamma 1 Magnitude
+    dtype: real
+    default: '0.85'
+    hide: none
+-   id: gamma1_phase_deg
+    label: Gamma 1 Phase
+    dtype: real
+    default: '160.0'
+    hide: none
+-   id: m
+    label: M
+    dtype: int
+    default: '2'
+    hide: none
+-   id: mod_depth
+    label: mod_depth
+    dtype: real
+    default: '1.0'
+    hide: none
+-   id: p_th
+    label: Harvesting Threshold
+    dtype: real
+    default: '0.001'
+    hide: none
+-   id: packet_bits
+    label: Number of Packet Bits
+    dtype: int
+    default: '16'
+    hide: none
+-   id: samp_rate
+    label: samp_rate
+    dtype: real
+    default: 2e6
+    hide: none
+-   id: slot_id
+    label: Assigned Slot ID
+    dtype: int
+    default: '0'
+    hide: none
+
+inputs:
+-   label: Carrier_In
+    dtype: complex
+    vlen: 1
+-   label: Data_In
+    dtype: byte
+    vlen: 1
+
+outputs:
+-   label: Reflection_Out
+    dtype: complex
+    vlen: 1
+
+templates:
+    imports: 'from backscatter_tag_miller import backscatter_tag_miller  # grc-generated
+        hier_block'
+    make: "backscatter_tag_miller(\n    alpha=${ alpha },\n    as_imag=${ as_imag\
+        \ },\n    as_real=${ as_real },\n    bit_rate=${ bit_rate },\n    enable_gated=${\
+        \ enable_gated },\n    gamma0_mag=${ gamma0_mag },\n    gamma0_phase_deg=${\
+        \ gamma0_phase_deg },\n    gamma1_mag=${ gamma1_mag },\n    gamma1_phase_deg=${\
+        \ gamma1_phase_deg },\n    m=${ m },\n    mod_depth=${ mod_depth },\n    p_th=${\
+        \ p_th },\n    packet_bits=${ packet_bits },\n    samp_rate=${ samp_rate },\n\
+        \    slot_id=${ slot_id },\n)"
+    callbacks:
+    - set_alpha(${ alpha })
+    - set_as_imag(${ as_imag })
+    - set_as_real(${ as_real })
+    - set_bit_rate(${ bit_rate })
+    - set_enable_gated(${ enable_gated })
+    - set_gamma0_mag(${ gamma0_mag })
+    - set_gamma0_phase_deg(${ gamma0_phase_deg })
+    - set_gamma1_mag(${ gamma1_mag })
+    - set_gamma1_phase_deg(${ gamma1_phase_deg })
+    - set_m(${ m })
+    - set_mod_depth(${ mod_depth })
+    - set_p_th(${ p_th })
+    - set_packet_bits(${ packet_bits })
+    - set_samp_rate(${ samp_rate })
+    - set_slot_id(${ slot_id })
+
+documentation: /home/geethikap/.local/state/gnuradio/backscatter_tag_miller.py
+grc_source: /media/Others/Documents/Research_Asst_Materials/GNU RADIO COMPANION/Hier
+    Blocks/tag_miller_back.grc
+
+file_format: 1

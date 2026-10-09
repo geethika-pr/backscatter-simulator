@@ -1,0 +1,28 @@
+id: new_hier1
+label: newhier1
+category: '[GRC Hier Blocks]'
+
+parameters: []
+
+inputs:
+-   label: in
+    dtype: byte
+    vlen: 1
+
+outputs:
+-   label: out
+    dtype: float
+    vlen: 1
+-   label: out
+    dtype: float
+    vlen: 1
+
+templates:
+    imports: 'from new_hier1 import new_hier1  # grc-generated hier_block'
+    make: new_hier1()
+    callbacks: []
+
+documentation: /home/geethikap/.local/state/gnuradio/new_hier1.py
+grc_source: /home/geethikap/tsthere.grc
+
+file_format: 1

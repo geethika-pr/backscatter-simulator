@@ -1,0 +1,50 @@
+id: backscatter_rx_bpsk
+label: Reciever BPSK (Backscatter)
+category: '[Backscatter Framework]'
+
+parameters:
+-   id: samp_rate
+    label: Sample Rate
+    dtype: real
+    default: 2e6
+    hide: none
+-   id: si_enable
+    label: Enable Self-Interference
+    dtype: real
+    default: '1'
+    hide: none
+-   id: si_isolation_db
+    label: SI Isolation (dB)
+    dtype: real
+    default: '25.0'
+    hide: none
+
+inputs:
+-   label: Antenna_In
+    dtype: complex
+    vlen: 1
+-   label: Tx_Leakage_In
+    dtype: complex
+    vlen: 1
+    optional: true
+
+outputs:
+-   label: Data_Out
+    dtype: byte
+    vlen: 1
+
+templates:
+    imports: 'from backscatter_rx_bpsk import backscatter_rx_bpsk  # grc-generated
+        hier_block'
+    make: "backscatter_rx_bpsk(\n    samp_rate=${ samp_rate },\n    si_enable=${ si_enable\
+        \ },\n    si_isolation_db=${ si_isolation_db },\n)"
+    callbacks:
+    - set_samp_rate(${ samp_rate })
+    - set_si_enable(${ si_enable })
+    - set_si_isolation_db(${ si_isolation_db })
+
+documentation: /home/geethikap/.local/state/gnuradio/backscatter_rx_bpsk.py
+grc_source: /media/Others/Documents/Research_Asst_Materials/GNU RADIO COMPANION/Hier
+    Blocks/rx_bpsk_back.grc
+
+file_format: 1

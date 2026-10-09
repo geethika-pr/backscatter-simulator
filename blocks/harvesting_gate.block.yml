@@ -1,0 +1,41 @@
+id: harvesting_gate
+label: Harvesting Gate
+category: '[Backscatter Framework]'
+
+parameters:
+-   id: alpha
+    label: alpha
+    dtype: real
+    default: '0.01'
+    hide: none
+-   id: p_th
+    label: p_th
+    dtype: real
+    default: '0.001'
+    hide: none
+
+inputs:
+-   label: rf_in
+    dtype: complex
+    vlen: 1
+-   label: m_in
+    dtype: float
+    vlen: 1
+
+outputs:
+-   label: m_out
+    dtype: float
+    vlen: 1
+
+templates:
+    imports: 'from harvesting_gate import harvesting_gate  # grc-generated hier_block'
+    make: "harvesting_gate(\n    alpha=${ alpha },\n    p_th=${ p_th },\n)"
+    callbacks:
+    - set_alpha(${ alpha })
+    - set_p_th(${ p_th })
+
+documentation: /home/geethikap/.local/state/gnuradio/harvesting_gate.py
+grc_source: /media/Others/Documents/Research_Asst_Materials/GNU RADIO COMPANION/Hier
+    Blocks/harvesting_gate.grc
+
+file_format: 1

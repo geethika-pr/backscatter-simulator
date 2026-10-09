@@ -1,0 +1,55 @@
+id: packet_hex_decoder
+label: Packet Hex Decoder
+category: '[Backscatter Framework]'
+
+parameters:
+-   id: bit_rate
+    label: Bit Rate
+    dtype: real
+    default: 10e3
+    hide: none
+-   id: packet_queue
+    label: Packet Queue
+    dtype: raw
+    default: None
+    hide: none
+-   id: payload_len_bits
+    label: Payload Length (Bits)
+    dtype: int
+    default: '16'
+    hide: none
+-   id: preamble
+    label: Preamble
+    dtype: string
+    default: '10101011'
+    hide: none
+-   id: samp_rate
+    label: Sample Rate
+    dtype: real
+    default: 2e6
+    hide: none
+
+inputs:
+-   label: in
+    dtype: byte
+    vlen: 1
+
+outputs: []
+
+templates:
+    imports: 'from packet_hex_decoder import packet_hex_decoder  # grc-generated hier_block'
+    make: "packet_hex_decoder(\n    bit_rate=${ bit_rate },\n    packet_queue=${ packet_queue\
+        \ },\n    payload_len_bits=${ payload_len_bits },\n    preamble=${ preamble\
+        \ },\n    samp_rate=${ samp_rate },\n)"
+    callbacks:
+    - set_bit_rate(${ bit_rate })
+    - set_packet_queue(${ packet_queue })
+    - set_payload_len_bits(${ payload_len_bits })
+    - set_preamble(${ preamble })
+    - set_samp_rate(${ samp_rate })
+
+documentation: /home/geethikap/.local/state/gnuradio/packet_hex_decoder.py
+grc_source: /media/Others/Documents/Research_Asst_Materials/GNU RADIO COMPANION/Hier
+    Blocks/packet_hex_decoder.grc
+
+file_format: 1

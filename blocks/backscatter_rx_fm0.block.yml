@@ -1,0 +1,62 @@
+id: backscatter_rx_fm0
+label: Reciever FM0 (Backscatter)
+category: '[Backscatter Framework]'
+
+parameters:
+-   id: bit_rate
+    label: Bit Rate
+    dtype: real
+    default: '10000'
+    hide: none
+-   id: samp_rate
+    label: Sample Rate
+    dtype: real
+    default: 2e6
+    hide: none
+-   id: si_enable
+    label: Enable Self-Interference
+    dtype: real
+    default: '1'
+    hide: none
+-   id: si_isolation_db
+    label: SI Isolation (dB)
+    dtype: real
+    default: '25.0'
+    hide: none
+-   id: threshold
+    label: Slicer Decision Threshold
+    dtype: real
+    default: '0.02'
+    hide: none
+
+inputs:
+-   label: Antenna_In
+    dtype: complex
+    vlen: 1
+-   label: Tx_Leakage_In
+    dtype: complex
+    vlen: 1
+    optional: true
+
+outputs:
+-   label: Data_Out
+    dtype: byte
+    vlen: 1
+
+templates:
+    imports: 'from backscatter_rx_fm0 import backscatter_rx_fm0  # grc-generated hier_block'
+    make: "backscatter_rx_fm0(\n    bit_rate=${ bit_rate },\n    samp_rate=${ samp_rate\
+        \ },\n    si_enable=${ si_enable },\n    si_isolation_db=${ si_isolation_db\
+        \ },\n    threshold=${ threshold },\n)"
+    callbacks:
+    - set_bit_rate(${ bit_rate })
+    - set_samp_rate(${ samp_rate })
+    - set_si_enable(${ si_enable })
+    - set_si_isolation_db(${ si_isolation_db })
+    - set_threshold(${ threshold })
+
+documentation: /home/geethikap/.local/state/gnuradio/backscatter_rx_fm0.py
+grc_source: /media/Others/Documents/Research_Asst_Materials/GNU RADIO COMPANION/Hier
+    Blocks/rx_fm0_back.grc
+
+file_format: 1

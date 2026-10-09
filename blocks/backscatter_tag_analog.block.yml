@@ -1,0 +1,126 @@
+id: backscatter_tag_analog
+label: Tag ANALOG (Backscatter)
+category: '[Backscatter Framework]'
+
+parameters:
+-   id: alpha
+    label: Alpha Factor
+    dtype: real
+    default: '0.01'
+    hide: none
+-   id: analog_mode
+    label: 0 = AM / 1 = FM
+    dtype: int
+    default: '0'
+    hide: none
+-   id: as_imag
+    label: Structural Scattering Imag
+    dtype: real
+    default: '0.02'
+    hide: none
+-   id: as_real
+    label: Structural Scattering Real
+    dtype: real
+    default: '0.05'
+    hide: none
+-   id: bit_rate
+    label: Bit Rate
+    dtype: real
+    default: 10e3
+    hide: none
+-   id: custom_g0_magnitude
+    label: Gamma 0 Magnitude
+    dtype: real
+    default: '0.2'
+    hide: none
+-   id: custom_g0_phase_deg
+    label: Gamma 0 Phase
+    dtype: real
+    default: '0.0'
+    hide: none
+-   id: custom_g1_mag
+    label: Gamma 1 Magnitude
+    dtype: real
+    default: '0.85'
+    hide: none
+-   id: custom_g1_phase_deg
+    label: Gamma 1 Phase
+    dtype: real
+    default: '180.0'
+    hide: none
+-   id: enable_gated
+    label: Gated Mode
+    dtype: int
+    default: '1'
+    hide: none
+-   id: mod_depth
+    label: Modulation Depth
+    dtype: real
+    default: '0.8'
+    hide: none
+-   id: p_th
+    label: Harvesting Threshold
+    dtype: real
+    default: '0.001'
+    hide: none
+-   id: packet_bits
+    label: Number of Packet Bits
+    dtype: int
+    default: '16'
+    hide: none
+-   id: samp_rate
+    label: Sample Rate
+    dtype: real
+    default: 2e6
+    hide: none
+-   id: slot_id
+    label: Assigned Slot ID
+    dtype: int
+    default: '0'
+    hide: none
+
+inputs:
+-   label: Carrier_In
+    dtype: complex
+    vlen: 1
+-   label: Signal_In
+    dtype: float
+    vlen: 1
+
+outputs:
+-   label: out
+    dtype: complex
+    vlen: 1
+
+templates:
+    imports: 'from backscatter_tag_analog import backscatter_tag_analog  # grc-generated
+        hier_block'
+    make: "backscatter_tag_analog(\n    alpha=${ alpha },\n    analog_mode=${ analog_mode\
+        \ },\n    as_imag=${ as_imag },\n    as_real=${ as_real },\n    bit_rate=${\
+        \ bit_rate },\n    custom_g0_magnitude=${ custom_g0_magnitude },\n    custom_g0_phase_deg=${\
+        \ custom_g0_phase_deg },\n    custom_g1_mag=${ custom_g1_mag },\n    custom_g1_phase_deg=${\
+        \ custom_g1_phase_deg },\n    enable_gated=${ enable_gated },\n    mod_depth=${\
+        \ mod_depth },\n    p_th=${ p_th },\n    packet_bits=${ packet_bits },\n \
+        \   samp_rate=${ samp_rate },\n    slot_id=${ slot_id },\n)"
+    callbacks:
+    - set_alpha(${ alpha })
+    - set_analog_mode(${ analog_mode })
+    - set_as_imag(${ as_imag })
+    - set_as_real(${ as_real })
+    - set_bit_rate(${ bit_rate })
+    - set_custom_g0_magnitude(${ custom_g0_magnitude })
+    - set_custom_g0_phase_deg(${ custom_g0_phase_deg })
+    - set_custom_g1_mag(${ custom_g1_mag })
+    - set_custom_g1_phase_deg(${ custom_g1_phase_deg })
+    - set_enable_gated(${ enable_gated })
+    - set_mod_depth(${ mod_depth })
+    - set_p_th(${ p_th })
+    - set_packet_bits(${ packet_bits })
+    - set_samp_rate(${ samp_rate })
+    - set_slot_id(${ slot_id })
+
+documentation: /home/geethikap/.local/state/gnuradio/backscatter_tag_analog.py
+grc_source: /media/Others/Documents/Research_Asst_Materials/GNU RADIO COMPANION/Hier
+    Blocks/tag_analog_back.grc
+
+file_format: 1

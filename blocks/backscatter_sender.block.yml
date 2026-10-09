@@ -1,0 +1,73 @@
+id: backscatter_sender
+label: Sender
+category: '[Backscatter Framework]'
+
+parameters:
+-   id: carrier_freq_send
+    label: Frequency Offset
+    dtype: real
+    default: '0'
+    hide: none
+-   id: command_bits
+    label: PIE Bits
+    dtype: raw
+    default: (0, 1, 0, 1)
+    hide: none
+-   id: enable_gated
+    label: Reader Gated Mode
+    dtype: int
+    default: '0'
+    hide: none
+-   id: phase_noise_std_send
+    label: 'Sender Phase Noise StdDev '
+    dtype: real
+    default: '0'
+    hide: none
+-   id: samp_rate_send
+    label: Sample Rate
+    dtype: real
+    default: 2e6
+    hide: none
+-   id: tari
+    label: Tari
+    dtype: real
+    default: '12.5'
+    hide: none
+-   id: tx_power_send
+    label: Transmit Power
+    dtype: real
+    default: '20'
+    hide: none
+
+inputs: []
+
+outputs:
+-   label: out
+    dtype: complex
+    vlen: 1
+-   label: tx_ref_out
+    dtype: complex
+    vlen: 1
+    optional: true
+
+templates:
+    imports: 'from backscatter_sender import backscatter_sender  # grc-generated hier_block'
+    make: "backscatter_sender(\n    carrier_freq_send=${ carrier_freq_send },\n  \
+        \  command_bits=${ command_bits },\n    enable_gated=${ enable_gated },\n\
+        \    phase_noise_std_send=${ phase_noise_std_send },\n    samp_rate_send=${\
+        \ samp_rate_send },\n    tari=${ tari },\n    tx_power_send=${ tx_power_send\
+        \ },\n)"
+    callbacks:
+    - set_carrier_freq_send(${ carrier_freq_send })
+    - set_command_bits(${ command_bits })
+    - set_enable_gated(${ enable_gated })
+    - set_phase_noise_std_send(${ phase_noise_std_send })
+    - set_samp_rate_send(${ samp_rate_send })
+    - set_tari(${ tari })
+    - set_tx_power_send(${ tx_power_send })
+
+documentation: /home/geethikap/.local/state/gnuradio/backscatter_sender.py
+grc_source: /media/Others/Documents/Research_Asst_Materials/GNU RADIO COMPANION/Hier
+    Blocks/sender_back.grc
+
+file_format: 1

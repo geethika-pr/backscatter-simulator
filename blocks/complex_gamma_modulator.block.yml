@@ -1,0 +1,82 @@
+id: complex_gamma_modulator
+label: Complex Gamma Modulator
+category: '[Backscatter Framework]'
+
+parameters:
+-   id: as_imag
+    label: as_imag
+    dtype: real
+    default: '0.02'
+    hide: none
+-   id: as_real
+    label: as_real
+    dtype: real
+    default: '0.5'
+    hide: none
+-   id: drift_pct
+    label: drift_pct
+    dtype: real
+    default: '0.0'
+    hide: none
+-   id: gamma0_mag
+    label: gamma0_mag
+    dtype: real
+    default: '0.2'
+    hide: none
+-   id: gamma0_phase_deg
+    label: gamma0_phase_deg
+    dtype: real
+    default: '0.0'
+    hide: none
+-   id: gamma1_mag
+    label: gamma1_mag
+    dtype: real
+    default: '0.85'
+    hide: none
+-   id: gamma1_phase_deg
+    label: gamma1_phase_deg
+    dtype: real
+    default: '180'
+    hide: none
+-   id: jitter_samples
+    label: jitter_samples
+    dtype: real
+    default: '0.0'
+    hide: none
+
+inputs:
+-   label: Carrier_In
+    dtype: complex
+    vlen: 1
+-   label: Mod_In
+    dtype: float
+    vlen: 1
+
+outputs:
+-   label: Reflection_Out
+    dtype: complex
+    vlen: 1
+
+templates:
+    imports: 'from complex_gamma_modulator import complex_gamma_modulator  # grc-generated
+        hier_block'
+    make: "complex_gamma_modulator(\n    as_imag=${ as_imag },\n    as_real=${ as_real\
+        \ },\n    drift_pct=${ drift_pct },\n    gamma0_mag=${ gamma0_mag },\n   \
+        \ gamma0_phase_deg=${ gamma0_phase_deg },\n    gamma1_mag=${ gamma1_mag },\n\
+        \    gamma1_phase_deg=${ gamma1_phase_deg },\n    jitter_samples=${ jitter_samples\
+        \ },\n)"
+    callbacks:
+    - set_as_imag(${ as_imag })
+    - set_as_real(${ as_real })
+    - set_drift_pct(${ drift_pct })
+    - set_gamma0_mag(${ gamma0_mag })
+    - set_gamma0_phase_deg(${ gamma0_phase_deg })
+    - set_gamma1_mag(${ gamma1_mag })
+    - set_gamma1_phase_deg(${ gamma1_phase_deg })
+    - set_jitter_samples(${ jitter_samples })
+
+documentation: /home/geethikap/.local/state/gnuradio/complex_gamma_modulator.py
+grc_source: /media/Others/Documents/Research_Asst_Materials/GNU RADIO COMPANION/Hier
+    Blocks/complex_gamma_modulator.grc
+
+file_format: 1

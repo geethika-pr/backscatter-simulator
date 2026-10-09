@@ -1,0 +1,174 @@
+{
+  "nodes": [
+    {
+      "id": "sender1",
+      "type": "sender",
+      "x": 120.0,
+      "y": 160.0,
+      "params": {
+        "tari": 12.5,
+        "enable_gated": 1,
+        "tx_power_send": 30,
+        "command_bits": [
+          0,
+          1,
+          0,
+          1
+        ],
+        "carrier_freq_send": 0,
+        "phase_noise_std_send": 0,
+        "samp_rate_send": 2000000.0
+      },
+      "order_seq": 0
+    },
+    {
+      "id": "tag_bpsk1",
+      "type": "tag_bpsk",
+      "x": 626.7895928861742,
+      "y": -203.60227783769722,
+      "params": {
+        "slot_id": 0,
+        "packet_bits": 10000,
+        "bit_rate": 10000.0,
+        "enable_gated": 1,
+        "p_th": 0.5,
+        "alpha": 0.01,
+        "as_real": 0.0,
+        "as_imag": 0.0,
+        "gamma0_mag": 0.8,
+        "gamma0_phase_deg": 0.0,
+        "gamma1_mag": 0.8,
+        "gamma1_phase_deg": 180.0,
+        "samp_rate": 2000000.0
+      },
+      "order_seq": 1,
+      "payload": [
+        1,
+        0,
+        1,
+        1,
+        0
+      ],
+      "payload_mode": "text",
+      "message_text": "Hello",
+      "chunk_bytes": 3,
+      "file_name": "",
+      "file_bytes_hex": ""
+    },
+    {
+      "id": "tag_bpsk2",
+      "type": "tag_bpsk",
+      "x": 608.8378569034494,
+      "y": 505.7772496765899,
+      "params": {
+        "slot_id": 1,
+        "packet_bits": 10000,
+        "bit_rate": 10000.0,
+        "enable_gated": 1,
+        "p_th": 0.5,
+        "alpha": 0.01,
+        "as_real": 0.0,
+        "as_imag": 0.0,
+        "gamma0_mag": 0.8,
+        "gamma0_phase_deg": 0.0,
+        "gamma1_mag": 0.8,
+        "gamma1_phase_deg": 180.0,
+        "samp_rate": 2000000.0
+      },
+      "order_seq": 2,
+      "payload": [
+        1,
+        1,
+        0,
+        0,
+        1
+      ],
+      "payload_mode": "text",
+      "message_text": "Geethika",
+      "chunk_bytes": 3,
+      "file_name": "",
+      "file_bytes_hex": ""
+    },
+    {
+      "id": "rx_bpsk1",
+      "type": "rx_bpsk",
+      "x": 1140.0,
+      "y": 160.0,
+      "params": {
+        "si_enable": 1,
+        "dc_len": 2048,
+        "si_isolation_db": 25.0,
+        "samp_rate": 2000000.0
+      },
+      "order_seq": 3,
+      "decoder_params": {
+        "payload_len_bits": 64,
+        "bit_rate": 10000.0,
+        "preamble": "10101011",
+        "samp_rate": 2000000.0
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "sender1",
+      "from_port": "Carrier_Out",
+      "to": "tag_bpsk1",
+      "to_port": "Carrier_In",
+      "channel_params": {
+        "distance": 1.0,
+        "fading_type_c1": 0,
+        "noise_volt_c1": 0.02,
+        "freq": 915000000.0,
+        "g_reader_dbi": 6.0,
+        "g_tag_dbi": 2.0,
+        "samp_rate_c1": 2000000.0
+      }
+    },
+    {
+      "from": "sender1",
+      "from_port": "Carrier_Out",
+      "to": "tag_bpsk2",
+      "to_port": "Carrier_In",
+      "channel_params": {
+        "distance": 1.0,
+        "fading_type_c1": 0,
+        "noise_volt_c1": 0.02,
+        "freq": 915000000.0,
+        "g_reader_dbi": 6.0,
+        "g_tag_dbi": 2.0,
+        "samp_rate_c1": 2000000.0
+      }
+    },
+    {
+      "from": "tag_bpsk1",
+      "from_port": "out",
+      "to": "rx_bpsk1",
+      "to_port": "Antenna_In",
+      "channel_params": {
+        "distance": 1.0,
+        "fading_type_c1": 0,
+        "noise_volt_c1": 0.01,
+        "freq": 915000000.0,
+        "g_reader_dbi": 6.0,
+        "g_tag_dbi": 2.0,
+        "samp_rate_c1": 2000000.0
+      }
+    },
+    {
+      "from": "tag_bpsk2",
+      "from_port": "out",
+      "to": "rx_bpsk1",
+      "to_port": "Antenna_In",
+      "channel_params": {
+        "distance": 1.0,
+        "fading_type_c1": 0,
+        "noise_volt_c1": 0.01,
+        "freq": 915000000.0,
+        "g_reader_dbi": 6.0,
+        "g_tag_dbi": 2.0,
+        "samp_rate_c1": 2000000.0
+      }
+    }
+  ]
+}

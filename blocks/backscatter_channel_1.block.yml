@@ -1,0 +1,76 @@
+id: backscatter_channel_1
+label: Channel
+category: '[Backscatter Framework]'
+
+parameters:
+-   id: distance
+    label: Channel - Distance (m)
+    dtype: real
+    default: '2'
+    hide: none
+-   id: fading_type_c1
+    label: Fading Mode (0=Clear, 1=Rician, 2=Rayleigh)
+    dtype: int
+    default: '0'
+    hide: none
+-   id: freq
+    label: Frequency
+    dtype: real
+    default: 915e6
+    hide: none
+-   id: g_reader_dbi
+    label: g_reader_dbi
+    dtype: real
+    default: '6.0'
+    hide: none
+-   id: g_tag_dbi
+    label: g_tag_dbi
+    dtype: real
+    default: '2.0'
+    hide: none
+-   id: noise_volt_c1
+    label: Channel - Noise Voltage
+    dtype: real
+    default: '0.01'
+    hide: none
+-   id: samp_rate_c1
+    label: Sample Rate
+    dtype: real
+    default: 2e6
+    hide: none
+
+inputs:
+-   label: Tag_In
+    dtype: complex
+    vlen: 1
+-   label: Interference_In
+    dtype: complex
+    vlen: 1
+    optional: true
+
+outputs:
+-   label: Channel_Out
+    dtype: complex
+    vlen: 1
+
+templates:
+    imports: 'from backscatter_channel_1 import backscatter_channel_1  # grc-generated
+        hier_block'
+    make: "backscatter_channel_1(\n    distance=${ distance },\n    fading_type_c1=${\
+        \ fading_type_c1 },\n    freq=${ freq },\n    g_reader_dbi=${ g_reader_dbi\
+        \ },\n    g_tag_dbi=${ g_tag_dbi },\n    noise_volt_c1=${ noise_volt_c1 },\n\
+        \    samp_rate_c1=${ samp_rate_c1 },\n)"
+    callbacks:
+    - set_distance(${ distance })
+    - set_fading_type_c1(${ fading_type_c1 })
+    - set_freq(${ freq })
+    - set_g_reader_dbi(${ g_reader_dbi })
+    - set_g_tag_dbi(${ g_tag_dbi })
+    - set_noise_volt_c1(${ noise_volt_c1 })
+    - set_samp_rate_c1(${ samp_rate_c1 })
+
+documentation: /home/geethikap/.local/state/gnuradio/backscatter_channel_1.py
+grc_source: /media/Others/Documents/Research_Asst_Materials/GNU RADIO COMPANION/Hier
+    Blocks/channel1_back.grc
+
+file_format: 1
