@@ -205,7 +205,10 @@ Run from the project root, venv active:
 """
 import sys
 import re
+import math
 from collections import defaultdict
+
+import numpy as np
 
 sys.path.insert(0, "blocks")
 sys.path.insert(0, ".")
@@ -221,6 +224,7 @@ from core.modulation_middleware import (
     plan_topology, TopologyMiddleware, DEFAULT_TAG_OVERRIDES, SI_ISOLATION_DEFAULTS,
     SAMP_RATE, RX_ALREADY_AT_BIT_RATE, PREAMBLE_BITS,
 )
+from core.signal_probe import SignalProbe
 
 # tag_analog needs a different payload shape (Signal_In/float, not
 # Data_In/byte + a 0/1 bit list) that TopologyMiddleware's own node loop
@@ -519,6 +523,94 @@ def _node_type_tooltip(type_name):
     return f"{type_name}\nPorts: {ports}"
 
 
+def _tag_identity_color(order_seq):
+    """Deterministic per-tag color for the wake-up-range visualization
+    (see CanvasWindow._update_wake_ranges()) -- used both for a tag's
+    own wake-up-range ring (drawn centered on its sender) and for the
+    colored margin drawn around that SAME tag's own icon, so a user can
+    trace which ring belongs to which tag by color alone. Golden-angle
+    hue stepping off NodeItem.order_seq (stable across a modulation-
+    switch rebuild -- see its own comment -- unlike node_id, which CAN
+    change on a switch, or self.edges' insertion order, which silently
+    flipped before): the same tag keeps the same color for its whole
+    life on the canvas, and any two different tags land far apart in
+    hue (137.5 degrees apart mod 360) no matter how many are on the
+    canvas. order_seq=None (shouldn't happen once a node has actually
+    been through add_node()) falls back to seq 0's color rather than
+    crashing."""
+    seq = order_seq if order_seq is not None else 0
+    hue = int((seq * 137.5) % 360.0)
+    return QtGui.QColor.fromHsv(hue, 210, 230)
+
+
+def _wake_up_radius_m(tx_power_send, p_th, freq, g_reader_dbi, g_tag_dbi):
+    """Forward-leg-only wake-up radius, in meters, for ONE tag on ONE
+    forward (sender->tag) edge -- see CanvasWindow._update_wake_ranges()
+    and claude/scope-and-direction.md for the full discussion this
+    implements. This is the distance at which the tag stops receiving
+    enough power to turn on AT ALL, given this sender's tx_power_send
+    and this edge's own channel settings -- it says nothing about
+    whether a tag inside this radius will DECODE correctly. That's the
+    return leg (reflection swing, SI isolation, noise, fading, DC-
+    blocking/slicing) -- a deliberate scope reduction agreed on
+    explicitly, not an oversight.
+
+    Inverts the two real blocks this mirrors, exactly as they're
+    actually wired:
+      - backscatter_channel_1.py's own Friis amplitude gain:
+            friis_gain(d) = 10**((g_reader_dbi+g_tag_dbi)/20)
+                            * (c/freq) / (4*pi*d)
+        so the carrier amplitude arriving at the tag is
+            tx_power_send * friis_gain(d)
+        (noise_volt_c1/fading are deliberately NOT folded in -- this is
+        the best-case radius for the given hardware/geometry settings,
+        not a guarantee under whatever noise/fading those are
+        separately set to).
+      - harvesting_gate_epy_block_0.py's own wake check:
+            current_pwr = |carrier|**2   (real**2 + imag**2 -- power,
+                                           not amplitude)
+            avg_pwr (EMA of current_pwr) >= p_th  ->  tag is powered
+        i.e. the tag is powered exactly while
+            (tx_power_send * friis_gain(d))**2 >= p_th
+
+    Solving that equality for d gives the formula below -- hence
+    sqrt(p_th), not p_th, in the denominator (current_pwr is already
+    squared). p_th<=0 (every tag_* type's registry default is >0, but a
+    user could still type 0 or less) returns float('inf') rather than
+    dividing by zero -- the caller treats a non-finite/absurd radius as
+    "don't draw a ring" the same way it skips a non-positive one."""
+    if p_th <= 0:
+        return float("inf")
+    c_light = 3e8
+    gain_const = (10 ** ((g_reader_dbi + g_tag_dbi) / 20.0)) * (c_light / freq) / (4.0 * 3.14159265)
+    return max(0.0, (float(tx_power_send) * gain_const) / (p_th ** 0.5))
+
+
+def _harvested_power(tx_power_send, distance_m, freq, g_reader_dbi, g_tag_dbi):
+    """Power actually arriving at a tag sitting `distance_m` meters from
+    its sender RIGHT NOW -- the forward evaluation of the same Friis
+    estimate _wake_up_radius_m() inverts (see its own docstring for the
+    full derivation and the noise/fading-excluded caveat, which applies
+    here identically: this is the best-case harvested power for these
+    settings, not a guarantee under whatever noise/fading is separately
+    configured). Mirrors backscatter_channel_1.py's own friis_gain
+    EXACTLY, including its `max(distance, 0.05)` floor (a tag sitting
+    on top of its sender doesn't get an infinite/divide-by-zero
+    reading), and harvesting_gate_epy_block_0.py's own current_pwr
+    (|carrier|**2 -- power, not amplitude). Used by NodeInspector.
+    _update_energy_info_label() for the harvested-energy figure -- kept
+    as its own separate function (not reusing _wake_up_radius_m()'s
+    internals) since that one SOLVES for a threshold distance while
+    this one EVALUATES at a given, already-known distance; conflating
+    the two into one function with a "mode" flag would be harder to
+    read than two small, single-purpose ones."""
+    distance_m = max(float(distance_m), 0.05)  # same floor backscatter_channel_1.py uses
+    c_light = 3e8
+    gain_const = (10 ** ((g_reader_dbi + g_tag_dbi) / 20.0)) * (c_light / freq) / (4.0 * 3.14159265)
+    amplitude = float(tx_power_send) * gain_const / distance_m
+    return amplitude ** 2
+
+
 class PortHandle(QtWidgets.QGraphicsEllipseItem):
     """One connectable port on a node -- a small circle, blue for an
     input, orange for an output, labeled with the port's real registry
@@ -678,6 +770,20 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         # by add_node() before this item is ever used for anything.
         self.order_seq = None
 
+        # Wake-up-range visualization (see CanvasWindow._update_wake_
+        # ranges()). show_wake_ranges is only ever read/written for a
+        # "sender" node (its checkbox lives on the sender's inspector
+        # panel -- see NodeInspector.wake_range_checkbox) but every
+        # NodeItem gets one set here so nothing needs a type_name check
+        # before touching it. _identity_highlight_item is the colored-
+        # margin child item drawn around THIS node's own icon/rect when
+        # it's a tag whose sender currently has ranges toggled on -- see
+        # set_identity_highlight() below. Lazily created (stays None
+        # until the first time a color is actually set), since most
+        # nodes never need one.
+        self.show_wake_ranges = False
+        self._identity_highlight_item = None
+
         nt = registry.NODE_TYPES[type_name]
         # Auto-wired ports (Data_In, Tx_Leakage_Out/In -- see
         # AUTO_WIRED_PORTS) were still drawn as a greyed-out dot even
@@ -815,6 +921,35 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         self.file_bytes = b"" if type_name.startswith("tag_") else None
         self.file_name = "" if type_name.startswith("tag_") else None
 
+        # Energy-consumption ESTIMATE (see NodeInspector._update_energy_
+        # info_label()) -- tag-only, same None-for-everything-else
+        # convention as payload/payload_mode above. Genuinely new
+        # values, not registry Params: nothing in any GNU Radio block
+        # reads either one, these only ever feed the inspector's own
+        # calculation. energy_per_bit is the PRIMARY figure (cost of
+        # toggling the reflection switch once per bit); energy_static_
+        # rate is a separate, optional add-on (a baseline draw just for
+        # staying active, independent of bit count) that defaults to 0
+        # so it's inert until a user deliberately opts in. Both are
+        # illustrative/relative units, not calibrated hardware joules.
+        self.energy_per_bit = 1.0 if type_name.startswith("tag_") else None
+        self.energy_static_rate = 0.0 if type_name.startswith("tag_") else None
+
+        # Which of this node's OUTPUT ports should get a live "View
+        # signal" window -- ticked in the inspector (see NodeInspector.
+        # _add_signal_checkboxes_for()) BEFORE Start, not opened live
+        # while running. Opening a tap by locking an already-RUNNING
+        # flowgraph (the first version of this feature) visibly froze/
+        # stuttered the sim -- tapping is now done once, up front, right
+        # after CanvasWindow.on_start() builds the topology but before
+        # mw.start() actually launches it, so the lock()/unlock() this
+        # still uses internally (SignalProbe._connect()) only ever
+        # touches a flowgraph that hasn't started yet. A plain set of
+        # port names (not persisted across Save/Load, same as which
+        # node is currently selected isn't) -- see
+        # CanvasWindow._open_pending_signal_views().
+        self.signal_probe_ports = set()
+
         # decoder_params: packet_hex_decoder's OWN param dict, carried on
         # the receiver it decodes for -- not a separate canvas node (see
         # PLACEABLE_NODE_TYPES' comment) and not a global/shared setting
@@ -850,6 +985,36 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
             h.position_label(width)
             self.port_handles[("out", p.name)] = h
 
+    def set_identity_highlight(self, color):
+        """Shows/hides the colored margin around this node's own icon/
+        rect -- CanvasWindow._update_wake_ranges() calls this on a tag
+        with `color` set to that SAME tag's _tag_identity_color() while
+        its wake-up-range ring is visible on the sender, and with
+        `color=None` to hide it again (toggled off, sender deleted, or
+        this tag has no forward edge at all right now). A thin
+        QGraphicsRectItem child drawn just outside this node's own
+        rect() -- works the same way whether this node has an icon
+        (NoBrush/NoPen underneath -- see __init__) or is a plain colored
+        rectangle, since it's an outline drawn OUTSIDE that rect either
+        way, not a change to this node's own pen/brush. Reused (just
+        repositioned/recolored) rather than recreated every call, since
+        _update_wake_ranges() redraws the whole set from scratch on
+        practically every edit."""
+        if color is None:
+            if self._identity_highlight_item is not None:
+                self._identity_highlight_item.setVisible(False)
+            return
+        margin = 5
+        rect = self.rect().adjusted(-margin, -margin, margin, margin)
+        if self._identity_highlight_item is None:
+            self._identity_highlight_item = QtWidgets.QGraphicsRectItem(rect, self)
+            self._identity_highlight_item.setBrush(QtGui.QBrush(QtCore.Qt.BrushStyle.NoBrush))
+            self._identity_highlight_item.setZValue(5)  # above icon/label, below Qt's selection box
+        else:
+            self._identity_highlight_item.setRect(rect)
+        self._identity_highlight_item.setPen(QtGui.QPen(color, 3))
+        self._identity_highlight_item.setVisible(True)
+
     def effective_fragment_bits(self):
         """Length, in bits, of ONE transmitted frame -- what the
         receiver this tag feeds needs as its payload_len/decoder
@@ -867,6 +1032,41 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         if self.payload_mode in ("text", "file"):
             return message_framer.fragment_len_bits(self.chunk_bytes)
         return len(self.payload) if self.payload else 0
+
+    def total_frame_bits(self):
+        """Total bits this tag actually puts on the wire over ONE FULL
+        payload cycle -- every fragment, back to back -- not just one
+        fragment's length. This is what NodeInspector._update_energy_
+        info_label() needs: a longer message/file genuinely has to cost
+        more to send, because it needs MORE fragments, even though each
+        individual fragment is still the same effective_fragment_bits()
+        long. Using effective_fragment_bits() alone for this (an actual
+        bug caught via feedback -- "Hello" and "Geethika" showed the
+        IDENTICAL energy cost) silently ignored message/file length
+        entirely, since fragment_len_bits(chunk_bytes) depends only on
+        chunk_bytes, never on the content.
+
+        Raw mode: identical to effective_fragment_bits() (one frame IS
+        the whole payload, looped forever -- there's no separate
+        "fragment count" concept in raw mode). Text/file mode: the
+        ACTUAL fragment count message_framer resolves this message/file
+        + chunk_bytes into (mirrors _update_message_info_label()'s own
+        build_fragments()/build_fragments_from_bytes() call -- same
+        ValueError-on-too-many-fragments handling, just returning 0
+        instead of showing it as a label error here) times
+        effective_fragment_bits() -- NOT effective_fragment_bits()
+        alone."""
+        if self.payload_mode not in ("text", "file"):
+            return self.effective_fragment_bits()
+        try:
+            if self.payload_mode == "file":
+                fragments = message_framer.build_fragments_from_bytes(
+                    self.file_bytes, 0, self.chunk_bytes)
+            else:
+                fragments = message_framer.build_fragments(self.message_text, 0, self.chunk_bytes)
+        except ValueError:
+            return 0
+        return len(fragments) * self.effective_fragment_bits()
 
     def itemChange(self, change, value):
         result = super().itemChange(change, value)
@@ -920,7 +1120,7 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
     # Line thickness in scene pixels. Was 2 -- feedback was "a bit
     # thicker", not a different style, so a modest bump rather than a
     # big jump. Same width for every edge, channel-bearing or not.
-    PEN_WIDTH = 3
+    PEN_WIDTH = 5
 
     def __init__(self, from_node, from_port_name, to_node, to_port_name):
         super().__init__()
@@ -955,6 +1155,20 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
             self.channel_params["distance"] = float(self.channel_params["distance"])
         else:
             self.channel_params = None
+        # The actual node id this edge's channel got the LAST time
+        # scene_to_topology() ran (e.g. "fwd_channel_tag_bpsk1_1") -- set
+        # there, not here, since that id is only meaningful for an actual
+        # run and is regenerated fresh every call. None until the first
+        # Start/Validate, or for any edge with no channel at all (role is
+        # None). This is what lets CanvasWindow._open_pending_signal_
+        # views() find this edge's live channel block in a running
+        # TopologyMiddleware.nodes.
+        self.live_channel_id = None
+        # Same idea as NodeItem.signal_probe_ports -- a channel only ever
+        # has the one "out" port, but the set form keeps show_edge()'s
+        # checkbox-building code identical to show_node()'s (see
+        # NodeInspector._add_signal_checkboxes_for()).
+        self.signal_probe_ports = set()
         # Selectable (so clicking it opens NodeInspector.show_edge(), the
         # same "click it like a block" the id/param widgets below give a
         # real node) only when it actually carries a channel -- an old
@@ -1366,6 +1580,318 @@ def _worst_bit_run(fragments, preamble_bits):
     return best
 
 
+class WaveformWidget(QtWidgets.QWidget):
+    """Minimal, dependency-free oscilloscope view: a rolling window of
+    samples drawn with plain QPainter. Deliberately NOT one of
+    gr-qtgui's own Qt-embedded sink widgets, and deliberately not
+    matplotlib/pyqtgraph either -- see core/signal_probe.py's module
+    docstring for why (Qt-binding risk for the former; an extra
+    third-party dependency this app doesn't otherwise need for the
+    latter). For a complex signal, draws the real part (solid) and
+    imaginary part (dashed) as two overlaid traces, the same basic I/Q
+    view any SDR scope shows; a float/byte signal just gets the one
+    line. Y-axis auto-scales to whatever's currently in the rolling
+    window so a tiny or huge signal is always readable.
+
+    Also shows a numeric power readout and (for a complex signal, which
+    is the only case with more than one trace -- a plain float/byte
+    signal is identified by the window's own title bar, not a legend
+    box) a small color-swatch legend, per request: the first version of
+    this had no numbers and no real legend, just a single line of
+    colored-matching text."""
+
+    MAX_SAMPLES = 4000
+
+    # Below this, treat the signal as silence rather than reporting a
+    # huge negative number every frame it's gated off -- a REAL
+    # vector_sink reporting exactly 0.0 (a gated-off tag, a channel with
+    # nothing feeding it yet) would otherwise make 10*log10(0) blow up
+    # to -inf and print nonsense.
+    POWER_FLOOR_DB = -120.0
+
+    def __init__(self, is_complex):
+        super().__init__()
+        self.is_complex = is_complex
+        # Rolling windows, held as NumPy arrays rather than a plain
+        # Python deque -- see add_samples()/draw_trace() below for why.
+        # Still exactly MAX_SAMPLES long at most, same "most recent N
+        # samples" semantics a deque(maxlen=...) gave us before.
+        self._real = np.empty(0, dtype=np.float64)
+        self._imag = np.empty(0, dtype=np.float64) if is_complex else None
+        self.setMinimumSize(480, 260)
+        self.setStyleSheet("background-color: #1e1e1e;")
+
+    def add_samples(self, samples):
+        if not samples:
+            return
+        # Only the most recent MAX_SAMPLES can ever survive in the
+        # rolling windows below, but read_new_samples() (core/signal_
+        # probe.py) hands back everything the vector_sink accumulated
+        # since the last poll, uncapped -- at a real sample rate (e.g.
+        # ~2 Msps) a single 50ms poll tick can return on the order of
+        # 100,000 samples. This was the main source of the signal-view
+        # scrolling stutter -- GNU Radio's own qtgui time sinks don't
+        # pay a per-sample Python cost at all (they render in C++), so
+        # ours was paying a cost GRC's never has to.
+        #
+        # Trimming the backlog first (same as before) bounds the work
+        # below to MAX_SAMPLES regardless of how far behind a probe has
+        # fallen. On top of that, the actual float conversion now goes
+        # through NumPy instead of a per-sample Python for-loop:
+        # np.asarray() converts the whole (already-trimmed) batch in
+        # one vectorized C-level pass, and .real/.imag on a complex
+        # array are just a view, not a copy -- no Python-level loop at
+        # all for what used to be the single biggest per-tick cost.
+        # This is the NumPy equivalent of GNU Radio's own C++ fast path
+        # for a signal-processing hot loop, with no new dependency
+        # (every Tier-1 GRC block here already imports numpy) and no
+        # compiler/build step, so the whole file stays plain Python.
+        tail = samples[-self.MAX_SAMPLES:]
+        arr = np.asarray(tail, dtype=np.complex128 if self.is_complex else np.float64)
+        if self.is_complex:
+            self._real = np.concatenate((self._real, arr.real))[-self.MAX_SAMPLES:]
+            self._imag = np.concatenate((self._imag, arr.imag))[-self.MAX_SAMPLES:]
+        else:
+            self._real = np.concatenate((self._real, arr))[-self.MAX_SAMPLES:]
+        self.update()
+
+    def _power_db(self):
+        """Mean power of the samples CURRENTLY in the rolling window, in
+        dB relative to an amplitude of 1.0 (the usual dBFS-style SDR
+        convention -- there's no absolute calibration anywhere in this
+        signal chain, e.g. no antenna gain/real transmit power in watts,
+        so this is explicitly labeled "rel." wherever it's drawn rather
+        than implying a real dBm/dBW reading). Vectorized (np.mean over
+        the whole window in one C-level pass) rather than a Python
+        sum()-over-a-generator loop -- same result, cheaper per call."""
+        if self._real.size == 0:
+            return None
+        if self.is_complex:
+            mean_sq = float(np.mean(self._real * self._real + self._imag * self._imag))
+        else:
+            mean_sq = float(np.mean(self._real * self._real))
+        if mean_sq <= 0.0:
+            return self.POWER_FLOOR_DB
+        return max(10.0 * math.log10(mean_sq), self.POWER_FLOOR_DB)
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        painter.fillRect(self.rect(), QtGui.QColor("#1e1e1e"))
+
+        if self._real.size == 0:
+            painter.setPen(QtGui.QColor("#888888"))
+            painter.drawText(self.rect(), QtCore.Qt.AlignmentFlag.AlignCenter,
+                              "Waiting for samples…")
+            return
+
+        # min()/max() over both traces at once, vectorized -- same
+        # result as concatenating the real/imag Python lists and
+        # calling the builtins on them, without materializing that
+        # list every repaint.
+        if self.is_complex:
+            vmax = float(max(self._real.max(), self._imag.max()))
+            vmin = float(min(self._real.min(), self._imag.min()))
+        else:
+            vmax = float(self._real.max())
+            vmin = float(self._real.min())
+        if vmax == vmin:  # flat signal (e.g. a silent gated tag) -- avoid a divide-by-zero
+            vmax += 1.0
+            vmin -= 1.0
+        span = vmax - vmin
+
+        def y_of(v):
+            return h - 1 - int((v - vmin) / span * (h - 1))
+
+        # Zero line, when zero actually falls within the current window.
+        if vmin <= 0.0 <= vmax:
+            zero_y = y_of(0.0)
+            painter.setPen(QtGui.QColor("#444444"))
+            painter.drawLine(0, zero_y, w, zero_y)
+
+        def draw_trace(trace, color, dashed):
+            n = trace.size
+            if n < 2:
+                return
+            pen = QtGui.QPen(QtGui.QColor(color))
+            pen.setWidth(2)
+            if dashed:
+                pen.setStyle(QtCore.Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            path = QtGui.QPainterPath()
+            # Decimate to at most two points (that column's min and
+            # max) per horizontal pixel, instead of one lineTo() call
+            # per sample. This path is rebuilt from scratch on every
+            # repaint (every poll tick, for every trace, now for every
+            # stacked row sharing this window) -- with MAX_SAMPLES=4000
+            # that was up to 4000 per-point Python calls even though a
+            # widget a few hundred pixels wide can't show more distinct
+            # points than that anyway. Min/max per column (rather than
+            # a plain average) keeps brief spikes visible instead of
+            # smoothing them away.
+            #
+            # The per-column min/max itself is computed with NumPy's
+            # np.minimum.reduceat()/np.maximum.reduceat() -- a single
+            # vectorized C-level pass over the whole trace -- instead
+            # of a Python loop calling the min()/max() builtins once
+            # per bucket. Qt's QPainterPath has no vectorized "add many
+            # points" entry point, so turning the result into
+            # path.lineTo() calls still needs one Python call per
+            # column either way, but that's now the ONLY per-column
+            # Python work left, bounded to roughly the widget's pixel
+            # width rather than also re-scanning each bucket in Python.
+            pixel_cols = max(int(w), 1)
+            if n <= pixel_cols * 2:
+                step = w / max(n - 1, 1)
+                path.moveTo(0.0, y_of(float(trace[0])))
+                for i in range(1, n):
+                    path.lineTo(i * step, y_of(float(trace[i])))
+            else:
+                starts = np.linspace(0, n, pixel_cols + 1)[:-1].astype(np.int64)
+                col_mins = np.minimum.reduceat(trace, starts)
+                col_maxs = np.maximum.reduceat(trace, starts)
+                col_width = w / pixel_cols
+                path.moveTo(0.0, y_of(float(trace[0])))
+                for col in range(starts.size):
+                    x = col * col_width
+                    path.lineTo(x, y_of(float(col_mins[col])))
+                    path.lineTo(x, y_of(float(col_maxs[col])))
+            painter.drawPath(path)
+
+        real_color = "#5dade2"
+        imag_color = "#f5b041"
+        draw_trace(self._real, real_color, dashed=False)
+        if self.is_complex:
+            draw_trace(self._imag, imag_color, dashed=True)
+
+        # Legend -- an actual swatch (a short line segment in the
+        # trace's own color/style) next to each trace's label, not just
+        # text colored to match: text stays in the same muted ink
+        # either way so it's readable regardless of the trace color
+        # underneath it. Only drawn for the complex case -- two traces
+        # is the only time identity ("which line is which") isn't
+        # already obvious from there being just the one.
+        muted = QtGui.QColor("#aaaaaa")
+        if self.is_complex:
+            legend_y = 14
+            for i, (label, color, dashed) in enumerate(
+                    [("I", real_color, False), ("Q", imag_color, True)]):
+                x0 = 8 + i * 70
+                pen = QtGui.QPen(QtGui.QColor(color))
+                pen.setWidth(2)
+                if dashed:
+                    pen.setStyle(QtCore.Qt.PenStyle.DashLine)
+                painter.setPen(pen)
+                painter.drawLine(x0, legend_y, x0 + 20, legend_y)
+                painter.setPen(muted)
+                painter.drawText(x0 + 26, legend_y + 4, label)
+
+        # Numeric readout -- mean power over the current rolling window,
+        # in dB relative to amplitude 1.0 (see _power_db()'s own
+        # docstring on why "rel." rather than a real dBm/dBW figure).
+        # Muted ink, top-right corner, same as the legend labels -- this
+        # is informational text, not another trace, so it doesn't get a
+        # trace color of its own.
+        db = self._power_db()
+        if db is not None:
+            db_text = f"Power: {db:.1f} dB (rel.)"
+            painter.setPen(muted)
+            metrics = painter.fontMetrics()
+            text_w = metrics.horizontalAdvance(db_text)
+            painter.drawText(w - text_w - 8, 16, db_text)
+
+
+class SignalViewWindow(QtWidgets.QWidget):
+    """A single free-floating, non-modal window showing EVERY ticked
+    SignalProbe's live output stacked vertically -- "not embedded to the
+    main canvas", by request, so it's a plain top-level QWidget (no
+    parent), never a QDockWidget/QDialog.
+
+    One window for the whole run, not one window per port -- per
+    explicit feedback that opening a separate window for each ticked
+    checkbox was unwieldy with several ports ticked at once, and a
+    request to instead do it "like GNU Radio" (GRC's own QT GUI sink
+    blocks stack multiple scopes in one window rather than popping up a
+    window each). Each probe gets its own row -- a small bold title
+    label (its node/port name, since there's no longer a separate
+    window title bar to carry that) directly above a WaveformWidget,
+    with a thin horizontal divider between rows so several stacked
+    scopes stay visually separated -- inside a QScrollArea so a run with
+    many ticked ports doesn't force the window itself to grow
+    arbitrarily tall. Deliberately NOT a heavier redesign (tabs, a grid,
+    per-row controls): "no need to customize it heavily," per request --
+    same scope/legend/readout each WaveformWidget already drew, just
+    laid out in one column instead of one per window.
+
+    All rows share ONE poll timer (same poll-driven pattern CanvasWindow's
+    own self.timer/poll_packets() already uses for decoded packets,
+    rather than anything GNU-Radio-GUI-thread-specific) instead of one
+    timer per probe -- there's only ever one of these windows open at a
+    time now, so one timer polling every row each tick is simpler than
+    N independent timers. Tears every probe down when closed, from
+    whichever side closes it first: the user closing this window, or
+    CanvasWindow.on_stop() force-closing it before the simulation itself
+    stops (see on_stop()'s own comment on why that ordering matters)."""
+
+    POLL_INTERVAL_MS = 50
+
+    def __init__(self, on_closed):
+        super().__init__()
+        self._on_closed = on_closed
+        self._torn_down = False
+        self._rows = []  # list of (probe, waveform_widget), polled together
+        self.setWindowTitle("Signal Monitor")
+        self.resize(560, 420)
+
+        outer = QtWidgets.QVBoxLayout(self)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        outer.addWidget(scroll)
+
+        self._rows_container = QtWidgets.QWidget()
+        self._rows_layout = QtWidgets.QVBoxLayout(self._rows_container)
+        scroll.setWidget(self._rows_container)
+
+        self.timer = QtCore.QTimer(self)
+        self.timer.setInterval(self.POLL_INTERVAL_MS)
+        self.timer.timeout.connect(self._poll)
+        self.timer.start()
+
+    def add_probe(self, title, probe):
+        """Adds one more stacked row for an already-created SignalProbe.
+        A divider precedes every row after the first, so N rows get
+        exactly N-1 separators rather than a trailing one after the
+        last row."""
+        if self._rows:
+            divider = QtWidgets.QFrame()
+            divider.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+            divider.setFrameShadow(QtWidgets.QFrame.Shadow.Sunken)
+            self._rows_layout.addWidget(divider)
+
+        title_label = QtWidgets.QLabel(title)
+        title_label.setStyleSheet("font-weight: bold;")
+        self._rows_layout.addWidget(title_label)
+
+        waveform = WaveformWidget(is_complex=(probe.dtype == "complex"))
+        self._rows_layout.addWidget(waveform)
+
+        self._rows.append((probe, waveform))
+
+    def _poll(self):
+        for probe, waveform in self._rows:
+            waveform.add_samples(probe.read_new_samples())
+
+    def closeEvent(self, event):
+        self.timer.stop()
+        if not self._torn_down:
+            for probe, _waveform in self._rows:
+                probe.teardown()
+            self._torn_down = True
+        self._on_closed(self)
+        super().closeEvent(event)
+
+
 class NodeInspector(QtWidgets.QWidget):
     """Right-side property panel for whatever single node is currently
     selected. Rebuilds its param form from registry.NODE_TYPES[...].params
@@ -1386,6 +1912,17 @@ class NodeInspector(QtWidgets.QWidget):
                                    # show_edge()) is what's selected
         self.param_widgets = {}
         self.decoder_param_widgets = {}
+        # Rows currently hidden/shown by the Advanced toggle (see
+        # _add_param_row()/_on_advanced_toggled() below) -- (label_widget,
+        # field_widget) pairs for every row whose registry Param has
+        # basic=False, rebuilt from scratch on every _clear_params_form()
+        # since the whole form is torn down and rebuilt on each selection.
+        self._advanced_param_rows = []
+        # Persists across selections (not reset per-node) -- switching
+        # from one advanced-heavy tag to another without the toggle
+        # snapping back to collapsed every time is less annoying while
+        # tuning several nodes in a row.
+        self._show_advanced = False
 
         self.setMinimumWidth(300)
         outer = QtWidgets.QVBoxLayout(self)
@@ -1400,18 +1937,59 @@ class NodeInspector(QtWidgets.QWidget):
         id_row.addRow("Node ID", self.id_edit)
         outer.addLayout(id_row)
 
+        # Everything below the Node ID -- modulation/payload selectors,
+        # the registry-driven params form, and the ports summary -- now
+        # lives in ONE scrollable area instead of two (the selectors used
+        # to sit fixed above a separately-scrolling, cramped params box).
+        # Scrolling this single area moves the modulation/payload combos
+        # out of view right along with everything else, same as scrolling
+        # any other panel. `scroll_content`/`scroll_layout` is also the
+        # hook a future "Advanced" toggle (hiding params below Harvesting
+        # Threshold until clicked) will attach to -- it can show/hide
+        # widgets inside this same layout without touching the scrolling
+        # mechanics set up here.
+        self.scroll_content = QtWidgets.QWidget()
+        self.scroll_layout = QtWidgets.QVBoxLayout(self.scroll_content)
+        self.scroll_layout.setContentsMargins(0, 0, 0, 0)
+
         # Modulation switcher -- only shown for tag_*/rx_* nodes (see
         # MODULATION_CHOICES' module comment for exactly what changing
         # this does and doesn't touch). Deliberately separate from the
-        # scrollable params_form below: it's a structural choice (which
-        # registry type this node actually is), not a tunable value.
+        # registry-driven params_form below: it's a structural choice
+        # (which registry type this node actually is), not a tunable
+        # value -- they just now share one scroll area with it.
         self.modulation_label = QtWidgets.QLabel("Modulation")
         self.modulation_combo = NoScrollComboBox()
         self.modulation_combo.addItems(MODULATION_CHOICES)
         self._updating_modulation_combo = False
         self.modulation_combo.currentTextChanged.connect(self._on_modulation_changed)
-        outer.addWidget(self.modulation_label)
-        outer.addWidget(self.modulation_combo)
+        self.scroll_layout.addWidget(self.modulation_label)
+        self.scroll_layout.addWidget(self.modulation_combo)
+
+        # "Show tag wake-up ranges" -- sender-only (see show_node()'s
+        # is_sender branch), reusing the signal-viewer's tick-box-not-
+        # push-button pattern even though this one DOES take effect
+        # immediately (no running flowgraph to freeze -- see
+        # CanvasWindow._update_wake_ranges(), the actual drawing).
+        # State lives on the sender NodeItem itself (show_wake_ranges),
+        # same place signal_probe_ports lives, and is NOT persisted
+        # across Save/Load, same as that and as "which node is
+        # currently selected" aren't -- it's a view toggle, not backend
+        # state scene_to_topology() would ever read.
+        self.wake_range_checkbox = QtWidgets.QCheckBox("Show tag wake-up ranges")
+        self.wake_range_checkbox.setToolTip(
+            "Draws one colored ring per tag wired directly to this sender (a forward "
+            "edge), centered on the sender, sized by that tag's own Harvesting "
+            "Threshold (p_th) against this sender's Tx Power and each edge's own "
+            "channel settings (frequency, antenna gains) -- see "
+            "CanvasWindow._update_wake_ranges(). Forward leg only: being inside the "
+            "ring means that tag CAN receive enough power to turn on, not that it "
+            "will decode correctly -- noise, fading, SI isolation and modulation-"
+            "specific decode issues are a separate concern, deliberately left out of "
+            "this circle."
+        )
+        self.wake_range_checkbox.toggled.connect(self._on_wake_range_toggled)
+        self.scroll_layout.addWidget(self.wake_range_checkbox)
 
         # Payload mode -- "Raw bits" is the original toddler-level mode
         # (one short hand-typed frame, repeated forever, below); "Text
@@ -1424,14 +2002,14 @@ class NodeInspector(QtWidgets.QWidget):
         self.payload_mode_combo.addItems(["Raw bits", "Text message", "File"])
         self._updating_payload_mode_combo = False
         self.payload_mode_combo.currentTextChanged.connect(self._on_payload_mode_changed)
-        outer.addWidget(self.payload_mode_label)
-        outer.addWidget(self.payload_mode_combo)
+        self.scroll_layout.addWidget(self.payload_mode_label)
+        self.scroll_layout.addWidget(self.payload_mode_combo)
 
         self.payload_label = QtWidgets.QLabel("Payload (bits, comma-separated)")
         self.payload_edit = QtWidgets.QLineEdit()
         self.payload_edit.editingFinished.connect(self._on_payload_changed)
-        outer.addWidget(self.payload_label)
-        outer.addWidget(self.payload_edit)
+        self.scroll_layout.addWidget(self.payload_label)
+        self.scroll_layout.addWidget(self.payload_edit)
 
         # "Text message" mode's own three controls -- message content,
         # how many bytes go into each fragment (the actual tunable
@@ -1442,8 +2020,8 @@ class NodeInspector(QtWidgets.QWidget):
         self.message_text_label = QtWidgets.QLabel("Message")
         self.message_text_edit = QtWidgets.QLineEdit()
         self.message_text_edit.editingFinished.connect(self._on_message_text_changed)
-        outer.addWidget(self.message_text_label)
-        outer.addWidget(self.message_text_edit)
+        self.scroll_layout.addWidget(self.message_text_label)
+        self.scroll_layout.addWidget(self.message_text_edit)
 
         # "File" mode's own control -- a file picker instead of a typed
         # message. The chosen file's raw bytes get framed exactly the
@@ -1457,20 +2035,20 @@ class NodeInspector(QtWidgets.QWidget):
         self.file_info_label = QtWidgets.QLabel("")
         self.file_info_label.setWordWrap(True)
         self.file_info_label.setStyleSheet("color: #666666;")
-        outer.addWidget(self.file_picker_button)
-        outer.addWidget(self.file_info_label)
+        self.scroll_layout.addWidget(self.file_picker_button)
+        self.scroll_layout.addWidget(self.file_info_label)
 
         self.chunk_bytes_label = QtWidgets.QLabel("Bytes per fragment")
         self.chunk_bytes_spin = NoScrollSpinBox()
         self.chunk_bytes_spin.setRange(1, message_framer.MAX_CHUNK_BYTES)
         self.chunk_bytes_spin.valueChanged.connect(self._on_chunk_bytes_changed)
-        outer.addWidget(self.chunk_bytes_label)
-        outer.addWidget(self.chunk_bytes_spin)
+        self.scroll_layout.addWidget(self.chunk_bytes_label)
+        self.scroll_layout.addWidget(self.chunk_bytes_spin)
 
         self.message_info_label = QtWidgets.QLabel("")
         self.message_info_label.setWordWrap(True)
         self.message_info_label.setStyleSheet("color: #666666;")
-        outer.addWidget(self.message_info_label)
+        self.scroll_layout.addWidget(self.message_info_label)
 
         # Preamble is deliberately a RECEIVER-side-only setting (see
         # plan_topology()'s docstring and _sync_decoder_params' preamble
@@ -1486,8 +2064,109 @@ class NodeInspector(QtWidgets.QWidget):
         self.preamble_info_label = QtWidgets.QLabel("")
         self.preamble_info_label.setWordWrap(True)
         self.preamble_info_label.setStyleSheet("color: #666666;")
-        outer.addWidget(self.preamble_info_label)
+        self.scroll_layout.addWidget(self.preamble_info_label)
 
+        # Energy model -- tag-only (same gating as preamble_info_label
+        # above), see _update_energy_info_label() for the actual
+        # calculation. Two NEW, genuinely illustrative per-tag knobs
+        # (energy_per_bit, energy_static_rate) -- NOT registry Params:
+        # nothing in any GNU Radio block reads either one, so they live
+        # as plain NodeItem attributes (see NodeItem.__init__) rather
+        # than going through make_param_widget()/registry.NODE_TYPES.
+        # Deliberately NOT calibrated to real hardware joules, same
+        # spirit as the signal viewer's "(rel.)" dB readout -- see
+        # claude/energy-consumption-estimate.md.
+        #
+        # Everything energy-related -- the two editable knobs AND the
+        # four computed results -- now lives inside ONE QGroupBox, per
+        # explicit feedback ("if you can group all these under a energy
+        # group much better"). Letting the group box itself provide the
+        # "Energy" title/border also means show_node()/show_edge() only
+        # ever need to toggle ONE widget's visibility instead of every
+        # child individually (see the `is_tag` branch below).
+        self.energy_group = QtWidgets.QGroupBox("Energy")
+        energy_layout = QtWidgets.QVBoxLayout(self.energy_group)
+        self.scroll_layout.addWidget(self.energy_group)
+
+        self.energy_per_bit_label = QtWidgets.QLabel("Energy per bit")
+        self.energy_per_bit_spin = NoScrollDoubleSpinBox()
+        self.energy_per_bit_spin.setRange(0.0, 1e9)
+        self.energy_per_bit_spin.setDecimals(4)
+        self.energy_per_bit_spin.setSingleStep(0.1)
+        self.energy_per_bit_spin.setToolTip(
+            "Primary energy figure: illustrative cost per bit switched. Not "
+            "calibrated to real hardware specs."
+        )
+        self.energy_per_bit_spin.valueChanged.connect(self._on_energy_per_bit_changed)
+        energy_layout.addWidget(self.energy_per_bit_label)
+        energy_layout.addWidget(self.energy_per_bit_spin)
+
+        self.energy_static_rate_label = QtWidgets.QLabel("Energy per second (while active)")
+        self.energy_static_rate_spin = NoScrollDoubleSpinBox()
+        self.energy_static_rate_spin.setRange(0.0, 1e9)
+        self.energy_static_rate_spin.setDecimals(4)
+        self.energy_static_rate_spin.setSingleStep(0.1)
+        self.energy_static_rate_spin.setToolTip(
+            "Optional baseline draw for staying active during transmission, "
+            "independent of bit count. Defaults to 0."
+        )
+        self.energy_static_rate_spin.valueChanged.connect(self._on_energy_static_rate_changed)
+        energy_layout.addWidget(self.energy_static_rate_label)
+        energy_layout.addWidget(self.energy_static_rate_spin)
+
+        # Clear visual break between the two editable inputs above and
+        # the read-only computed results below.
+        self.energy_result_divider = QtWidgets.QFrame()
+        self.energy_result_divider.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+        self.energy_result_divider.setFrameShadow(QtWidgets.QFrame.Shadow.Sunken)
+        energy_layout.addWidget(self.energy_result_divider)
+
+        # Four computed results (Transmission time / Consumed-switching /
+        # Consumed-staying-active / Harvested), each as a VALUE line
+        # (bold, the plain/default text color the rest of the inspector
+        # already uses -- e.g. the "Node ID" row -- NOT the muted grey
+        # "description" color) followed by its own small grey CALCULATION
+        # line underneath. Per explicit feedback: the old version put
+        # everything -- the actual numbers included -- in one muted-grey
+        # block, so the numbers themselves read as a passive description
+        # instead of the thing the user actually came here to see. Kept
+        # as plain QLabels (not line edits) -- read-only, not meant to
+        # look like an editable field (unlike energy_per_bit_spin above).
+        self._energy_result_rows = []
+        for attr_prefix in ("time", "switch", "static", "harvest"):
+            value_label = QtWidgets.QLabel("")
+            value_label.setStyleSheet("font-weight: bold; font-size: 11pt;")
+            value_label.setWordWrap(True)
+            desc_label = QtWidgets.QLabel("")
+            desc_label.setStyleSheet("color: #888888; font-size: 8pt;")
+            desc_label.setWordWrap(True)
+            energy_layout.addWidget(value_label)
+            energy_layout.addWidget(desc_label)
+            setattr(self, f"energy_{attr_prefix}_value_label", value_label)
+            setattr(self, f"energy_{attr_prefix}_desc_label", desc_label)
+            self._energy_result_rows.append((value_label, desc_label))
+
+        # Advanced toggle -- hides every row whose registry Param has
+        # basic=False (RF-physics tuning: harvesting threshold, alpha,
+        # structural scattering, gamma0/1, sample rate, etc.) until
+        # clicked. Driven entirely by each NodeType's own Param.basic
+        # flag (registry.py), not a hardcoded field list, so it applies
+        # uniformly to every tag type (tag_ook/tag_bpsk/tag_fm0/
+        # tag_miller/tag_analog) as well as every rx_*/channel/sender/
+        # decoder type.
+        #
+        # self.advanced_toggle_button is NOT created here -- it's now a
+        # ROW INSIDE params_form (right after "Gated Mode" for types
+        # that have one, otherwise right before the first advanced row
+        # -- see _insert_advanced_toggle_row(), called from show_node()'s
+        # and show_edge()'s own params loops), so it scrolls and
+        # positions itself exactly like the other rows. _clear_params_
+        # form()'s removeRow() loop DELETES every row's widgets on each
+        # rebuild, so the button itself is rebuilt fresh every time too
+        # (same as every other param widget) rather than kept as one
+        # persistent instance -- self._show_advanced below is the actual
+        # state that survives across rebuilds; the button is just this
+        # call's rendering of it.
         self.params_form_widget = QtWidgets.QWidget()
         self.params_form = QtWidgets.QFormLayout(self.params_form_widget)
         # Stack each row's label ABOVE its field instead of beside it.
@@ -1499,14 +2178,46 @@ class NodeInspector(QtWidgets.QWidget):
         self.params_form.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapAllRows)
         self.params_form.setFieldGrowthPolicy(
             QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
-        scroll = QtWidgets.QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(self.params_form_widget)
-        outer.addWidget(scroll, 1)
+        # No nested QScrollArea here anymore -- params_form_widget is a
+        # plain child of scroll_layout now, so it scrolls together with
+        # the selectors above it inside the ONE scroll area set up below.
+        self.scroll_layout.addWidget(self.params_form_widget)
 
         self.ports_label = QtWidgets.QLabel("")
         self.ports_label.setWordWrap(True)
-        outer.addWidget(self.ports_label)
+        self.scroll_layout.addWidget(self.ports_label)
+
+        # "View signal" checkboxes -- one per OUTPUT port of whatever node
+        # or channel is currently shown. Ticking one records intent on
+        # the NodeItem/EdgeItem itself (node_item.signal_probe_ports --
+        # see its own comment) rather than opening anything right away:
+        # the actual SignalProbe tap only gets connected once, up front,
+        # right after CanvasWindow.on_start() builds the topology but
+        # BEFORE mw.start() launches it (see
+        # CanvasWindow._open_pending_signal_views()). This used to be a
+        # push-button that opened the window immediately by locking the
+        # live flowgraph mid-run -- which visibly froze/stuttered the
+        # simulation (locking a RUNNING top_block briefly pauses its
+        # scheduler to let you reconfigure it) -- so now the only way to
+        # get one open is: tick it, then Start. Rebuilt from scratch in
+        # show_node()/show_edge() -- same as params_form -- since the set
+        # of output ports differs per type. Disabled (greyed out, with a
+        # tooltip) while the sim is already running, since ticking one
+        # then has no effect until the next Start -- see
+        # _update_signal_checkboxes_enabled(), called both here and from
+        # CanvasWindow.on_start()/on_stop().
+        self.signal_checks_widget = QtWidgets.QWidget()
+        self.signal_checks_layout = QtWidgets.QVBoxLayout(self.signal_checks_widget)
+        self.signal_checks_layout.setContentsMargins(0, 0, 0, 0)
+        self.scroll_layout.addWidget(self.signal_checks_widget)
+        self._signal_checks = []  # (checkbox, probe_owner, port_name) triples
+
+        self.scroll_layout.addStretch(1)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self.scroll_content)
+        outer.addWidget(scroll, 1)
 
         self.setEnabled(False)
 
@@ -1514,6 +2225,7 @@ class NodeInspector(QtWidgets.QWidget):
         self.current_node = node_item
         self.current_edge = None
         self._clear_params_form()
+        self._clear_signal_checks()
 
         if node_item is None:
             self.setEnabled(False)
@@ -1522,6 +2234,7 @@ class NodeInspector(QtWidgets.QWidget):
             self.id_edit.setEnabled(True)
             self.modulation_label.setVisible(False)
             self.modulation_combo.setVisible(False)
+            self.wake_range_checkbox.setVisible(False)
             self.payload_mode_label.setVisible(False)
             self.payload_mode_combo.setVisible(False)
             self.payload_label.setVisible(True)
@@ -1535,6 +2248,7 @@ class NodeInspector(QtWidgets.QWidget):
             self.chunk_bytes_spin.setVisible(False)
             self.message_info_label.setVisible(False)
             self.preamble_info_label.setVisible(False)
+            self.energy_group.setVisible(False)
             self.ports_label.setText("")
             return
 
@@ -1553,6 +2267,13 @@ class NodeInspector(QtWidgets.QWidget):
             if idx >= 0:
                 self.modulation_combo.setCurrentIndex(idx)
             self._updating_modulation_combo = False
+
+        is_sender = node_item.type_name == "sender"
+        self.wake_range_checkbox.setVisible(is_sender)
+        if is_sender:
+            self.wake_range_checkbox.blockSignals(True)
+            self.wake_range_checkbox.setChecked(node_item.show_wake_ranges)
+            self.wake_range_checkbox.blockSignals(False)
 
         is_tag = node_item.payload is not None
         is_raw_mode = is_tag and node_item.payload_mode == "raw"
@@ -1602,6 +2323,16 @@ class NodeInspector(QtWidgets.QWidget):
         if is_tag:
             self._update_preamble_info_label(node_item)
 
+        self.energy_group.setVisible(is_tag)
+        if is_tag:
+            self.energy_per_bit_spin.blockSignals(True)
+            self.energy_per_bit_spin.setValue(node_item.energy_per_bit)
+            self.energy_per_bit_spin.blockSignals(False)
+            self.energy_static_rate_spin.blockSignals(True)
+            self.energy_static_rate_spin.setValue(node_item.energy_static_rate)
+            self.energy_static_rate_spin.blockSignals(False)
+            self._update_energy_info_label()
+
         # Recompute this receiver's decoder config (and, for FM0/Miller,
         # its own bit_rate param -- see _sync_decoder_params' docstring)
         # BEFORE building either params form below, so what's displayed
@@ -1614,10 +2345,30 @@ class NodeInspector(QtWidgets.QWidget):
                 node_item, self.window._find_upstream_tags(node_item), notify=False)
 
         nt = registry.NODE_TYPES[node_item.type_name]
+        # Where the Advanced toggle lands in THIS type's params: right
+        # after "Gated Mode" (enable_gated) for the types that have one
+        # (every tag_* type plus sender) -- by explicit request, even
+        # though tag_miller's "m"/tag_analog's "analog_mode"/sender's
+        # "tx_power_send" are also basic=True and end up sitting below it
+        # as a result. Types with no enable_gated at all (every rx_*,
+        # channel, pie_decoder, packet_hex_decoder) fall back to the
+        # generic rule instead: right before the first basic=False row.
+        advanced_toggle_inserted = False
         for p in nt.params:
             widget = self._make_param_widget(p.name, node_item.params.get(p.name, p.default))
-            self.params_form.addRow(p.label or p.name, widget)
+            if p.name == "enable_gated":
+                self._add_inline_checkbox_row(p.label or p.name, widget)
+                self.param_widgets[p.name] = widget
+                self._insert_advanced_toggle_row()
+                advanced_toggle_inserted = True
+                continue
+            if not advanced_toggle_inserted and not p.basic:
+                self._insert_advanced_toggle_row()
+                advanced_toggle_inserted = True
+            self._add_param_row(p.label or p.name, widget, not p.basic)
             self.param_widgets[p.name] = widget
+        if not advanced_toggle_inserted:
+            self._insert_advanced_toggle_row()
 
         # Decoder settings, for rx_* nodes only -- same form, same tab,
         # right below this receiver's own params (see decoder_params'
@@ -1670,11 +2421,13 @@ class NodeInspector(QtWidgets.QWidget):
                         "consistently (used to be a fixed, hardcoded value ignored by "
                         "this field -- fixed now, see plan_topology()'s docstring)."
                     )
-                self.params_form.addRow(p.label or p.name, widget)
+                self._add_param_row(p.label or p.name, widget, not p.basic)
                 self.decoder_param_widgets[p.name] = widget
 
         port_descriptions = ", ".join(f"{p.name} ({p.direction}/{p.dtype})" for p in nt.ports)
         self.ports_label.setText(f"Ports: {port_descriptions}")
+
+        self._add_signal_checkboxes_for(node_item.type_name, node_item, node_item.node_id)
 
     def show_edge(self, edge_item):
         """The per-tag channel living on a sender->tag_* or tag_*->rx_*
@@ -1689,6 +2442,7 @@ class NodeInspector(QtWidgets.QWidget):
         self.current_node = None
         self.current_edge = edge_item
         self._clear_params_form()
+        self._clear_signal_checks()
 
         self.setEnabled(True)
         role_text = ("Forward (sender -> tag)" if edge_item.role == "forward"
@@ -1698,6 +2452,7 @@ class NodeInspector(QtWidgets.QWidget):
         self.id_edit.setEnabled(False)  # identified by its endpoints, not renamed
         self.modulation_label.setVisible(False)
         self.modulation_combo.setVisible(False)
+        self.wake_range_checkbox.setVisible(False)
         self.payload_mode_label.setVisible(False)
         self.payload_mode_combo.setVisible(False)
         self.payload_label.setVisible(False)
@@ -1710,14 +2465,24 @@ class NodeInspector(QtWidgets.QWidget):
         self.chunk_bytes_spin.setVisible(False)
         self.message_info_label.setVisible(False)
         self.preamble_info_label.setVisible(False)
+        self.energy_group.setVisible(False)
 
         ch_nt = registry.NODE_TYPES["channel"]
+        # channel has no "enable_gated" row -- always the generic rule,
+        # right before the first basic=False row (see the matching
+        # comment in show_node()).
+        advanced_toggle_inserted = False
         for p in ch_nt.params:
             widget = make_param_widget(
                 p.name, edge_item.channel_params.get(p.name, p.default),
                 self._on_channel_param_changed)
-            self.params_form.addRow(p.label or p.name, widget)
+            if not advanced_toggle_inserted and not p.basic:
+                self._insert_advanced_toggle_row()
+                advanced_toggle_inserted = True
+            self._add_param_row(p.label or p.name, widget, not p.basic)
             self.param_widgets[p.name] = widget
+        if not advanced_toggle_inserted:
+            self._insert_advanced_toggle_row()
 
         # Interference_In is deliberately not surfaced at all -- nothing
         # wires it on a per-edge channel (TopologyMiddleware zero-sources
@@ -1729,27 +2494,217 @@ class NodeInspector(QtWidgets.QWidget):
             "zero-sourced) -- nothing to wire for it here."
         )
 
+        # live_channel_id is only assigned by scene_to_topology() (i.e.
+        # once Validate/Start has actually run) -- doesn't matter here,
+        # unlike the old button version: ticking this checkbox just
+        # records intent on edge_item.signal_probe_ports, and
+        # CanvasWindow._open_pending_signal_views() reads
+        # edge_item.live_channel_id fresh, AFTER the next
+        # scene_to_topology() call, not whatever stale value this show_
+        # edge() call happened to see.
+        self._add_signal_checkboxes_for("channel", edge_item, "channel")
+
+    def refresh_after_run_state_change(self):
+        """Called from CanvasWindow.on_start()/on_stop() -- re-shows
+        whatever node or edge is currently selected so its "View signal"
+        checkboxes reflect the state that just changed: enabled/disabled
+        (ticking one has no effect while already running, so they're
+        greyed out then). A no-op when nothing is selected -- there are
+        no checkboxes to refresh in that case."""
+        if self.current_node is not None:
+            self.show_node(self.current_node)
+        elif self.current_edge is not None:
+            self.show_edge(self.current_edge)
+
     def _clear_params_form(self):
         while self.params_form.rowCount():
             self.params_form.removeRow(0)
         self.param_widgets = {}
         self.decoder_param_widgets = {}
+        # The form was just torn down -- every row in it, including any
+        # advanced ones, is gone, so the tracking list has to start empty
+        # again too (the rebuild below repopulates it).
+        self._advanced_param_rows = []
+
+    def _clear_signal_checks(self):
+        while self.signal_checks_layout.count():
+            item = self.signal_checks_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._signal_checks = []
+
+    def _add_signal_checkboxes_for(self, type_name, owner, title_prefix):
+        """Adds one "View signal: <port>" checkbox per OUTPUT port that
+        `type_name` declares in the registry (registry.NODE_TYPES[...].
+        ports, direction == "out"). `owner` is the NodeItem or EdgeItem
+        this checkbox's state actually lives on (owner.signal_probe_ports
+        -- see either class's own comment); ticking/unticking here just
+        edits that set, it does NOT open or close any window itself --
+        CanvasWindow._open_pending_signal_views() is what acts on it,
+        once, right after the next Start. Shared by show_node() (owner
+        is the node_item) and show_edge() (owner is the edge_item) -- a
+        channel's "out" port is recorded the same way a tag's or
+        receiver's is, so there's no separate code path for it. Covers
+        every node type uniformly (all five tag_* types -- tag_analog
+        included -- every rx_*, sender's two outputs, channel) since it
+        reads the registry rather than any hardcoded per-type port
+        list. `title_prefix` is unused now that opening happens
+        elsewhere -- kept as a parameter so callers don't need to
+        change, titles are built fresh in _open_pending_signal_views()
+        instead."""
+        nt = registry.NODE_TYPES[type_name]
+        out_ports = [p for p in nt.ports if p.direction == "out"]
+        for p in out_ports:
+            label = f"View signal: {p.name}" if len(out_ports) > 1 else "View signal"
+            checkbox = QtWidgets.QCheckBox(label)
+            checkbox.blockSignals(True)
+            checkbox.setChecked(p.name in owner.signal_probe_ports)
+            checkbox.blockSignals(False)
+            checkbox.toggled.connect(
+                lambda checked, ow=owner, pn=p.name: self._on_signal_check_toggled(ow, pn, checked)
+            )
+            self.signal_checks_layout.addWidget(checkbox)
+            self._signal_checks.append((checkbox, owner, p.name))
+        self._update_signal_checks_enabled()
+
+    def _on_signal_check_toggled(self, owner, port_name, checked):
+        if checked:
+            owner.signal_probe_ports.add(port_name)
+        else:
+            owner.signal_probe_ports.discard(port_name)
+
+    def _update_signal_checks_enabled(self):
+        """Called right after building the checkboxes above, and again
+        from CanvasWindow.on_start()/on_stop() (via refresh_after_run_
+        state_change()). Greyed out while the sim is already running --
+        ticking one then would silently do nothing until the NEXT Start
+        (see CanvasWindow._open_pending_signal_views()), which is worse
+        than just not letting you tick it, hence the tooltip explaining
+        why instead of leaving it clickable-but-pointless."""
+        running = self.window.mw is not None
+        for checkbox, _owner, _port_name in self._signal_checks:
+            checkbox.setEnabled(not running)
+            checkbox.setToolTip(
+                "Stop the simulation to change which signals are shown -- "
+                "ticking this only takes effect the next time you Start."
+                if running else ""
+            )
 
     def _make_param_widget(self, name, current_value):
         return make_param_widget(name, current_value, self._on_param_changed)
+
+    def _add_param_row(self, label_text, widget, is_advanced):
+        """Adds one row to params_form, same as a plain addRow() call,
+        except a basic=False (advanced) row also gets tracked so the
+        Advanced toggle can show/hide it later, and starts out matching
+        whatever the toggle is CURRENTLY set to (not always hidden) --
+        otherwise switching to a node/edge while "Show advanced" is
+        already on would rebuild every advanced row hidden again, which
+        would look like the toggle silently turned itself back off.
+
+        This is the one place that reads Param.basic, so it's what makes
+        the toggle apply uniformly to every node/edge type's params --
+        tag_ook/tag_bpsk/tag_fm0/tag_miller/tag_analog, every rx_* type,
+        channel, and the inline decoder-settings rows -- with no
+        per-type special-casing: whichever NodeType a row's Param came
+        from, basic=False means hidden-until-toggled, full stop."""
+        self.params_form.addRow(label_text, widget)
+        if is_advanced:
+            label_widget = self.params_form.labelForField(widget)
+            self._advanced_param_rows.append((label_widget, widget))
+            widget.setVisible(self._show_advanced)
+            if label_widget is not None:
+                label_widget.setVisible(self._show_advanced)
+
+    def _insert_advanced_toggle_row(self):
+        """Builds a fresh Advanced-toggle button and adds it as its own
+        full-width row in params_form, right where the caller currently
+        is in that type's param loop (see show_node()/show_edge() for
+        exactly where that is per type). A NEW button is built every
+        call rather than reusing one persistent instance, because
+        _clear_params_form()'s removeRow() loop deletes the Qt widgets
+        of every row it tears down on each rebuild -- trying to keep
+        self.advanced_toggle_button alive across rebuilds would leave it
+        pointing at a deleted C++ object the next time a different node/
+        edge is selected. self._show_advanced is the state that actually
+        persists across rebuilds; this button is just this call's
+        rendering of it, handed the current state up front so it doesn't
+        visually snap back to "collapsed" on every selection change."""
+        self.advanced_toggle_button = QtWidgets.QPushButton()
+        self.advanced_toggle_button.setCheckable(True)
+        self.advanced_toggle_button.blockSignals(True)
+        self.advanced_toggle_button.setChecked(self._show_advanced)
+        self.advanced_toggle_button.blockSignals(False)
+        self._update_advanced_toggle_text()
+        self.advanced_toggle_button.toggled.connect(self._on_advanced_toggled)
+        self.params_form.addRow(self.advanced_toggle_button)
+
+    def _add_inline_checkbox_row(self, label_text, checkbox_widget):
+        """Gated Mode ONLY, by explicit request -- keeps its checkbox
+        directly beside its label instead of the WrapAllRows label-
+        above-field stacking every other param row uses. rowWrapPolicy
+        is a single form-wide QFormLayout setting with no per-row
+        override, so the only way to break the pattern for just this
+        one row is to make the row's single field a composite widget
+        that does its own inline layout, added the same single-argument
+        way the "Decoder (this receiver)" header spans a row today."""
+        row_widget = QtWidgets.QWidget()
+        row_layout = QtWidgets.QHBoxLayout(row_widget)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.addWidget(QtWidgets.QLabel(label_text))
+        row_layout.addWidget(checkbox_widget)
+        row_layout.addStretch(1)
+        self.params_form.addRow(row_widget)
+
+    def _update_advanced_toggle_text(self):
+        self.advanced_toggle_button.setText(
+            "Hide advanced parameters ▲" if self._show_advanced
+            else "Show advanced parameters ▼")
+
+    def _on_advanced_toggled(self, checked):
+        self._show_advanced = checked
+        self._update_advanced_toggle_text()
+        for label_widget, field_widget in self._advanced_param_rows:
+            field_widget.setVisible(checked)
+            if label_widget is not None:
+                label_widget.setVisible(checked)
 
     def _on_decoder_param_changed(self, name, value):
         if self.current_node is not None and self.current_node.decoder_params is not None:
             self.current_node.decoder_params[name] = value
 
+    def _on_wake_range_toggled(self, checked):
+        if self.current_node is not None and self.current_node.type_name == "sender":
+            self.current_node.show_wake_ranges = checked
+            self.window._update_wake_ranges()
+
     def _on_param_changed(self, name, value):
         if self.current_node is not None:
             self.current_node.params[name] = value
+            # tx_power_send (sender) and p_th (any tag) both feed
+            # _wake_up_radius_m() -- cheap enough at this canvas's scale
+            # to just always refresh rather than checking `name` against
+            # those two specifically.
+            self.window._update_wake_ranges()
+            # bit_rate and p_th both feed _update_energy_info_label()
+            # too (duration = N/bit_rate; p_th gates the harvested
+            # figure) -- same "just always refresh" reasoning. A no-op
+            # for a non-tag node (that label isn't even visible then).
+            self._update_energy_info_label()
 
     def _on_channel_param_changed(self, name, value):
         if self.current_edge is None or self.current_edge.channel_params is None:
             return
         self.current_edge.channel_params[name] = value
+        # freq/g_reader_dbi/g_tag_dbi all feed _wake_up_radius_m() too --
+        # same reasoning as _on_param_changed() above, always refresh
+        # rather than special-casing which param names matter. The
+        # "distance" branch below ALSO ends up here indirectly (via
+        # set_channel_edge_distance() -> itemChange() -> update_edges_
+        # for_node()), so this call is harmless-redundant in that case,
+        # not wrong.
+        self.window._update_wake_ranges()
         if name == "distance":
             # Keep the canvas honest: typing a new distance moves the
             # tag end of this edge to match, the same proportional-
@@ -1792,6 +2747,7 @@ class NodeInspector(QtWidgets.QWidget):
                                            "Payload must be comma-separated 0/1 bits.")
             return
         self.current_node.payload = bits
+        self._update_energy_info_label()  # raw-mode payload length feeds N bits
 
     def _on_payload_mode_changed(self, text):
         if self._updating_payload_mode_combo or self.current_node is None:
@@ -1804,6 +2760,7 @@ class NodeInspector(QtWidgets.QWidget):
             return
         self.current_node.message_text = self.message_text_edit.text()
         self._update_message_info_label()
+        self._update_energy_info_label()
 
     def _on_choose_file_clicked(self):
         """File-mode's equivalent of _on_message_text_changed() --
@@ -1830,12 +2787,14 @@ class NodeInspector(QtWidgets.QWidget):
         self.current_node.file_name = os.path.basename(path)
         self._update_file_info_label()
         self._update_message_info_label()
+        self._update_energy_info_label()
 
     def _on_chunk_bytes_changed(self, value):
         if self.current_node is None:
             return
         self.current_node.chunk_bytes = value
         self._update_message_info_label()
+        self._update_energy_info_label()
 
     def _update_file_info_label(self):
         """Live summary of the currently-chosen file (name + size), same
@@ -1938,6 +2897,142 @@ class NodeInspector(QtWidgets.QWidget):
             "can't desync tag vs. receiver."
         )
 
+    def _on_energy_per_bit_changed(self, value):
+        # valueChanged (not editingFinished) so this fires on every typed
+        # digit/arrow-key/spin-button change, not just on Enter/blur --
+        # otherwise the energy readout silently shows a stale number
+        # until the field loses focus.
+        if self.current_node is not None:
+            self.current_node.energy_per_bit = value
+            self._update_energy_info_label()
+
+    def _on_energy_static_rate_changed(self, value):
+        if self.current_node is not None:
+            self.current_node.energy_static_rate = value
+            self._update_energy_info_label()
+
+    def refresh_energy_info(self, node_item):
+        """Keeps the energy-estimate label live while a tag is open and
+        either it or its sender is being dragged -- moving either
+        endpoint changes the forward edge's actual distance, which
+        feeds the harvested-power figure (see _update_energy_info_
+        label()). Same pattern/reason as refresh_channel_distance()."""
+        if self.current_node is node_item:
+            self._update_energy_info_label()
+
+    def _update_energy_info_label(self):
+        """Recomputes and displays the THREE SEPARATE energy figures
+        for the currently-shown tag -- per explicit request, these are
+        never folded into one combined/net number:
+
+          1. Consumed by switching: energy_per_bit * N bits -- the
+             PRIMARY figure. N is node.total_frame_bits(), the total
+             bit count across every fragment of the tag's actual
+             message/file payload for one full cycle (NOT just one
+             fragment's length -- that undercounts anything longer
+             than a single chunk), so this tracks raw/text/file
+             payload mode and message/file length automatically, no
+             separate bookkeeping needed.
+          2. Consumed by staying active: energy_static_rate * duration
+             (duration = N / bit_rate) -- a SEPARATE, optional add-on;
+             energy_static_rate defaults to 0, so this line reads 0
+             until a user deliberately opts in.
+          3. Harvested: _harvested_power() (the same Friis-based
+             estimate _wake_up_radius_m() inverts, see its own
+             docstring) at this tag's OWN current forward-edge
+             distance, over the same duration -- reported as 0 (tag
+             never even powers on) if that power is below the tag's
+             own p_th, matching harvesting_gate's real gate exactly.
+
+        All three are illustrative/relative units, not calibrated
+        hardware joules -- see claude/energy-consumption-estimate.md.
+
+        A fourth, non-energy row ("Transmission time") comes first,
+        giving the shared `duration = N / bit_rate` value its own row --
+        added after feedback that seeing a nonzero "...s" figure the
+        instant a tag was selected, with nothing touched, read as if it
+        might be a running clock (real elapsed time, or time since the
+        app opened). It's pure arithmetic (bits divided by bit_rate),
+        not a timer -- the same value feeds rows 3 and 4 below.
+
+        Each row is a (bold VALUE label, small grey CALCULATION label)
+        pair -- see self._energy_result_rows, built in __init__ -- per
+        explicit feedback that putting the actual numbers in the same
+        muted grey as their description made the numbers themselves
+        read as passive/secondary instead of the thing the user is here
+        to see."""
+        node = self.current_node
+        if node is None or node.energy_per_bit is None:
+            return
+        bit_rate = node.params.get("bit_rate")
+        n_bits = node.total_frame_bits()
+        if not bit_rate or n_bits <= 0:
+            self.energy_time_value_label.setText("Energy estimate unavailable")
+            self.energy_time_desc_label.setText(
+                "Requires a bit_rate and a non-empty payload/message")
+            for value_label, desc_label in self._energy_result_rows[1:]:
+                value_label.setText("")
+                desc_label.setText("")
+            return
+        duration = n_bits / float(bit_rate)
+
+        # Row 1: transmission duration.
+        self.energy_time_value_label.setText(f"Transmission time: {duration:.3g}s")
+        self.energy_time_desc_label.setText(
+            f"{n_bits} bit(s) / {bit_rate:.3g} bit/s")
+
+        # Row 2: consumed by switching -- the PRIMARY figure.
+        self.energy_switch_value_label.setText(
+            f"Consumed (switching): {node.energy_per_bit * n_bits:.3g} units")
+        self.energy_switch_desc_label.setText(
+            f"{n_bits} bit(s) x {node.energy_per_bit:.3g}/bit")
+
+        # Row 3: consumed by staying active -- secondary, opt-in.
+        self.energy_static_value_label.setText(
+            f"Consumed (staying active): {node.energy_static_rate * duration:.3g} units")
+        self.energy_static_desc_label.setText(
+            f"{duration:.3g}s x {node.energy_static_rate:.3g}/s")
+
+        # Row 4: harvested -- tertiary, gated by this tag's own p_th
+        # exactly like harvesting_gate's real check.
+        fwd_edge = next((e for e in self.window.edges
+                          if e.role == "forward" and e.to_node is node), None)
+        if fwd_edge is None or fwd_edge.channel_params is None:
+            self.energy_harvest_value_label.setText("Harvested: --")
+            self.energy_harvest_desc_label.setText("No forward edge wired")
+        else:
+            sender = fwd_edge.from_node
+            tx_power_send = sender.params.get("tx_power_send")
+            freq = fwd_edge.channel_params.get("freq")
+            g_reader_dbi = fwd_edge.channel_params.get("g_reader_dbi")
+            g_tag_dbi = fwd_edge.channel_params.get("g_tag_dbi")
+            distance = fwd_edge.channel_params.get("distance")
+            p_th = node.params.get("p_th")
+            if tx_power_send is None or not freq or distance is None:
+                self.energy_harvest_value_label.setText("Harvested: --")
+                self.energy_harvest_desc_label.setText("Missing sender/channel settings")
+            else:
+                power = _harvested_power(
+                    float(tx_power_send), float(distance), float(freq),
+                    float(g_reader_dbi), float(g_tag_dbi))
+                if p_th is not None and power < float(p_th):
+                    self.energy_harvest_value_label.setText("Harvested: 0 units")
+                    self.energy_harvest_desc_label.setText(
+                        f"Below Harvesting Threshold at {distance:.3g}m")
+                else:
+                    self.energy_harvest_value_label.setText(
+                        f"Harvested: {power * duration:.3g} units")
+                    self.energy_harvest_desc_label.setText(
+                        f"{duration:.3g}s at {distance:.3g}m")
+
+        tooltip = (
+            "Illustrative, uncalibrated relative units. Reported as separate "
+            "figures rather than a combined total."
+        )
+        for value_label, desc_label in self._energy_result_rows:
+            value_label.setToolTip(tooltip)
+            desc_label.setToolTip(tooltip)
+
     def _on_id_changed(self):
         if self.current_node is None:
             return
@@ -1982,10 +3077,21 @@ class CanvasWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("Backscatter Canvas (experimental)")
         self.mw = None  # the running TopologyMiddleware, or None while stopped
+        # The one open SignalViewWindow (holding every ticked port's
+        # probe as a stacked row), or None while none is open -- see
+        # _open_pending_signal_views() and on_stop()'s force-close-
+        # before-mw.stop() ordering.
+        self._signal_view_window = None
         self._node_counter = defaultdict(int)
         self._next_order_seq = 0  # see NodeItem.order_seq's own comment
         self.nodes = {}   # node_id -> NodeItem
         self.edges = []   # list of EdgeItem
+        # Every QGraphicsEllipseItem currently drawn by _update_wake_
+        # ranges() (the wake-up-range rings) -- tracked separately from
+        # self.edges/self.nodes since these aren't backend state, just
+        # this method's own on-canvas drawing, cleared and rebuilt from
+        # scratch on every call.
+        self.wake_range_items = []
         # Decoder settings now live on each rx_* NodeItem itself
         # (.decoder_params) -- see NodeItem's comment. No global dict
         # here any more.
@@ -2118,7 +3224,8 @@ class CanvasWindow(QtWidgets.QMainWindow):
 
     def add_node(self, type_name, scene_pos, node_id=None, params=None, payload=None,
                  decoder_params=None, payload_mode=None, message_text=None, chunk_bytes=None,
-                 file_bytes=None, file_name=None, order_seq=None):
+                 file_bytes=None, file_name=None, order_seq=None,
+                 energy_per_bit=None, energy_static_rate=None):
         """node_id/params/payload/decoder_params/payload_mode/message_text/
         chunk_bytes/file_bytes/file_name let _load_layout_dict() recreate
         a saved node exactly (same id, same edited values) instead of
@@ -2166,6 +3273,10 @@ class CanvasWindow(QtWidgets.QMainWindow):
             item.file_bytes = file_bytes
         if file_name is not None and item.file_name is not None:
             item.file_name = file_name
+        if energy_per_bit is not None and item.energy_per_bit is not None:
+            item.energy_per_bit = energy_per_bit
+        if energy_static_rate is not None and item.energy_static_rate is not None:
+            item.energy_static_rate = energy_static_rate
         self.view.scene().addItem(item)
         self.nodes[node_id] = item
         self.status.showMessage(f"Added {type_name} as '{node_id}'", 3000)
@@ -2178,6 +3289,7 @@ class CanvasWindow(QtWidgets.QMainWindow):
         edge = EdgeItem(from_node, from_port_name, to_node, to_port_name)
         self.view.scene().addItem(edge)
         self.edges.append(edge)
+        self._update_wake_ranges()
         return edge
 
     def _edge_exists(self, from_node, from_port_name, to_node, to_port_name):
@@ -2254,6 +3366,139 @@ class CanvasWindow(QtWidgets.QMainWindow):
                 if edge.role is not None:
                     edge.sync_distance_from_position()
                     self.inspector.refresh_channel_distance(edge)
+                    if edge.role == "forward":
+                        # Dragging EITHER endpoint (the tag or its
+                        # sender) changes this edge's actual distance,
+                        # which feeds the tag's own harvested-energy
+                        # estimate -- see NodeInspector._update_energy_
+                        # info_label(). edge.to_node is always the tag
+                        # on a forward edge (see _edge_channel_role()).
+                        self.inspector.refresh_energy_info(edge.to_node)
+        self._update_wake_ranges()
+
+    def _update_wake_ranges(self):
+        """Redraws every currently-visible wake-up-range ring (and the
+        matching colored margin around each ring's own tag icon) from
+        scratch -- see NodeInspector's sender-only "Show tag wake-up
+        ranges" checkbox, _tag_identity_color(), and _wake_up_radius_m()
+        for the rest of this feature. Called from every place that can
+        change what should be drawn: a node move (update_edges_for_
+        node(), e.g. dragging the sender or a tag -- a ring is centered
+        on the sender and sized in absolute scene pixels, so moving
+        EITHER endpoint has to redraw it), any param edit that feeds the
+        formula (NodeInspector._on_param_changed()/_on_channel_param_
+        changed() -- tx_power_send, p_th, freq, g_reader_dbi,
+        g_tag_dbi), the checkbox itself, and wiring/unwiring a forward
+        edge (add_edge()/_delete_edge()/_delete_node()/paste_
+        clipboard()).
+
+        Simplest correct approach: clear every ring and every tag's
+        margin, then rebuild the whole set fresh from current state --
+        cheap at the node counts this canvas is meant for, and avoids
+        having to work out exactly which ring/margin a given edit could
+        have gone stale (e.g. toggling the checkbox off has to erase
+        every ring that sender was showing, not just whichever one edge
+        happens to have changed).
+
+        Forward-leg-only, per the agreed scope (see claude/scope-and-
+        direction.md): one ring per "forward" edge (_edge_channel_
+        role()) into a tag, from a sender whose own show_wake_ranges is
+        True, centered on the SENDER (not the tag), radius from
+        _wake_up_radius_m() using THAT edge's own channel_params (not a
+        generic/global value -- a different edge to a different tag can
+        have a different frequency/antenna gain) together with the
+        sender's own tx_power_send and the tag's own p_th. Deliberately
+        NOT a function of the edge's "distance" -- this ring is the
+        MAXIMUM distance at which the tag would still wake up given its
+        own p_th and this sender's settings, not a reaction to where the
+        tag actually happens to be sitting right now. Dragging the tag
+        (or typing a new distance) moves the TAG relative to this fixed
+        ring -- that's the whole point, it's what lets you see whether
+        the tag is currently inside or outside its own wake-up range --
+        it must never resize the ring itself; only tx_power_send, p_th,
+        freq, g_reader_dbi, or g_tag_dbi can do that. A radius
+        that comes back non-finite (p_th<=0) or non-positive is skipped
+        entirely rather than drawn as some huge/invalid ellipse."""
+        scene = self.view.scene()
+        for item in self.wake_range_items:
+            scene.removeItem(item)
+        self.wake_range_items = []
+        for node in self.nodes.values():
+            if node.type_name.startswith("tag_"):
+                node.set_identity_highlight(None)
+
+        for edge in self.edges:
+            if edge.role != "forward" or edge.channel_params is None:
+                continue
+            sender, tag = edge.from_node, edge.to_node
+            if not sender.show_wake_ranges:
+                continue
+            tx_power_send = sender.params.get("tx_power_send")
+            p_th = tag.params.get("p_th")
+            freq = edge.channel_params.get("freq")
+            g_reader_dbi = edge.channel_params.get("g_reader_dbi")
+            g_tag_dbi = edge.channel_params.get("g_tag_dbi")
+            if tx_power_send is None or p_th is None or not freq:
+                continue
+            radius_m = _wake_up_radius_m(
+                float(tx_power_send), float(p_th), float(freq),
+                float(g_reader_dbi), float(g_tag_dbi))
+            if not (radius_m > 0) or radius_m == float("inf"):
+                continue
+
+            radius_px = radius_m * PIXELS_PER_METER
+            color = _tag_identity_color(tag.order_seq)
+            center = sender.sceneBoundingRect().center()
+            ellipse = QtWidgets.QGraphicsEllipseItem(
+                center.x() - radius_px, center.y() - radius_px,
+                radius_px * 2, radius_px * 2)
+            # Filled, not just an outline -- an earlier NoBrush/thin-
+            # dashed-line version ("low opacity", per feedback) was very
+            # easy to lose against the grid background/other rings,
+            # especially with several tags' circles overlapping. Same
+            # per-tag color on both the fill (translucent, so nodes/
+            # edges drawn on top of it -- see zValue below -- and
+            # overlapping rings from OTHER tags stay readable) and the
+            # border (solid, near-opaque, so the boundary itself -- the
+            # actual point of the ring -- still reads clearly even where
+            # two tags' fills overlap and blend).
+            fill_color = QtGui.QColor(color)
+            fill_color.setAlpha(60)
+            border_color = QtGui.QColor(color)
+            border_color.setAlpha(220)
+            ellipse.setBrush(QtGui.QBrush(fill_color))
+            # Outline width only (NOT the fill/circle size) -- per explicit
+            # feedback that with several tags' rings on screen at once,
+            # the boundary itself ("the actual point of the ring") is
+            # the thing that needs to stay readable where rings overlap.
+            ellipse.setPen(QtGui.QPen(border_color, 5))
+            ellipse.setZValue(-2)  # under edges/nodes, same convention as EdgeItem's -1
+            ellipse.setFlag(QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+            scene.addItem(ellipse)
+            self.wake_range_items.append(ellipse)
+            tag.set_identity_highlight(color)
+
+            # Small tag_id label identifying which tag this ring belongs
+            # to -- can't curve text along the ellipse's own outline in
+            # Qt's graphics view without building a custom path-text
+            # item, so per the user's own stated fallback, it's placed
+            # just above the ring's top point instead, attached to the
+            # line visually by color + proximity rather than by sitting
+            # literally on top of the stroke.
+            label = QtWidgets.QGraphicsSimpleTextItem(tag.node_id)
+            label_font = label.font()
+            label_font.setPointSize(15)
+            label_font.setBold(True)
+            label.setFont(label_font)
+            label.setBrush(QtGui.QBrush(border_color))
+            label_rect = label.boundingRect()
+            label.setPos(
+                center.x() - label_rect.width() / 2.0,
+                center.y() - radius_px - label_rect.height())
+            label.setZValue(-2)
+            label.setFlag(QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+            scene.addItem(label)
+            self.wake_range_items.append(label)
 
     def set_channel_edge_distance(self, edge, meters):
         """Inverse of EdgeItem.sync_distance_from_position(): typing a
@@ -2404,12 +3649,14 @@ class CanvasWindow(QtWidgets.QMainWindow):
         self.view.scene().removeItem(node_item)
         if self.inspector.current_node is node_item:
             self.inspector.show_node(None)
+        self._update_wake_ranges()
 
     def _delete_edge(self, edge_item):
         self.edges.remove(edge_item)
         self.view.scene().removeItem(edge_item)
         if self.inspector.current_edge is edge_item:
             self.inspector.show_node(None)
+        self._update_wake_ranges()
 
     def copy_selected(self):
         """Copies the one selected node's own data (type, params, payload,
@@ -2445,6 +3692,8 @@ class CanvasWindow(QtWidgets.QMainWindow):
             "chunk_bytes": node.chunk_bytes,
             "file_bytes": node.file_bytes,
             "file_name": node.file_name,
+            "energy_per_bit": node.energy_per_bit,
+            "energy_static_rate": node.energy_static_rate,
             "forward_from": fwd_edge.from_node if fwd_edge is not None else None,
             "forward_channel_params": dict(fwd_edge.channel_params) if fwd_edge is not None else None,
             "return_to": ret_edge.to_node if ret_edge is not None else None,
@@ -2469,7 +3718,9 @@ class CanvasWindow(QtWidgets.QMainWindow):
                                   payload=clip["payload"], decoder_params=clip["decoder_params"],
                                   payload_mode=clip["payload_mode"], message_text=clip["message_text"],
                                   chunk_bytes=clip["chunk_bytes"], file_bytes=clip["file_bytes"],
-                                  file_name=clip["file_name"])
+                                  file_name=clip["file_name"],
+                                  energy_per_bit=clip.get("energy_per_bit"),
+                                  energy_static_rate=clip.get("energy_static_rate"))
 
         # Recreate the same wiring the original tag had, to the SAME
         # sender/receiver (not a copy of them) -- only if that node is
@@ -2503,6 +3754,12 @@ class CanvasWindow(QtWidgets.QMainWindow):
         self.status.showMessage(msg, 4000)
         self.view.scene().clearSelection()
         new_node.setSelected(True)
+        # add_edge() above already refreshed the wake-up-range rings, but
+        # using the freshly-SEEDED channel_params -- the carried-over
+        # freq/g_reader_dbi/g_tag_dbi (see the channel_params.update()
+        # calls above) land AFTER that, so one more refresh here is what
+        # actually picks those up.
+        self._update_wake_ranges()
 
     def keyPressEvent(self, event):
         ctrl = event.modifiers() & QtCore.Qt.KeyboardModifier.ControlModifier
@@ -2955,6 +4212,13 @@ class CanvasWindow(QtWidgets.QMainWindow):
             channel_counter += 1
             prefix = "fwd_channel" if e.role == "forward" else "ret_channel"
             channel_id = f"{prefix}_{e.to_node.node_id if e.role == 'forward' else e.from_node.node_id}_{channel_counter}"
+            # Remembered on the edge itself (see EdgeItem.live_channel_id's
+            # own comment) so "View signal" on THIS edge's channel can
+            # find it in a running TopologyMiddleware.nodes later --
+            # this id is only ever meaningful for the run this call is
+            # currently building, which is exactly when on_start() calls
+            # this method.
+            e.live_channel_id = channel_id
             nodes.append({"id": channel_id, "type": "channel", "params": dict(e.channel_params)})
             edges.append((e.from_node.node_id, e.from_port_name, channel_id, "Signal_In"))
             edges.append((channel_id, "out", e.to_node.node_id, e.to_port_name))
@@ -3060,6 +4324,9 @@ class CanvasWindow(QtWidgets.QMainWindow):
                 # already got.
                 n["file_name"] = item.file_name
                 n["file_bytes_hex"] = (item.file_bytes or b"").hex()
+            if item.energy_per_bit is not None:
+                n["energy_per_bit"] = item.energy_per_bit
+                n["energy_static_rate"] = item.energy_static_rate
             nodes.append(n)
         # Each edge saves as a plain [from, from_port, to, to_port] list,
         # same shape as before, UNLESS it actually carries a channel (see
@@ -3086,6 +4353,7 @@ class CanvasWindow(QtWidgets.QMainWindow):
         self.view.scene().clear()
         self.nodes = {}
         self.edges = []
+        self.wake_range_items = []  # scene.clear() already deleted these Qt objects
         self._node_counter = defaultdict(int)
         self.inspector.show_node(None)
 
@@ -3106,6 +4374,8 @@ class CanvasWindow(QtWidgets.QMainWindow):
                 # never been through a modulation switch, which is every
                 # pre-existing saved layout).
                 order_seq=n.get("order_seq"),
+                energy_per_bit=n.get("energy_per_bit"),
+                energy_static_rate=n.get("energy_static_rate"),
             )
         for entry in data.get("edges", []):
             if isinstance(entry, dict):
@@ -3202,15 +4472,35 @@ class CanvasWindow(QtWidgets.QMainWindow):
             self.mw = None
             return
         self._rebuild_decoder_docks()
+        # Connects every ticked "View signal" tap BEFORE mw.start() --
+        # see _open_pending_signal_views()'s own docstring for why that
+        # ordering is what actually fixes the freeze/stutter opening one
+        # mid-run used to cause.
+        self._open_pending_signal_views()
         self.mw.start()
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.validate_button.setEnabled(False)
         self.clear_button.setEnabled(False)
         self.timer.start()
+        # Picks up both the newly-live mw (buttons that were disabled can
+        # now be clicked) and, for a channel edge, the live_channel_id
+        # scene_to_topology() just assigned above -- see
+        # NodeInspector.refresh_after_run_state_change()'s own docstring.
+        self.inspector.refresh_after_run_state_change()
 
     def on_stop(self):
         self.timer.stop()
+        # Force-close the signal-view window BEFORE mw.stop() -- its
+        # closeEvent tears down every probe it holds via SignalProbe.
+        # teardown(), which does its own tb.lock()/disconnect()/
+        # tb.unlock() against the STILL-RUNNING flowgraph. Doing this
+        # after mw.stop() would mean teardown() locking/disconnecting a
+        # top_block that's already torn down, which is both pointless
+        # and not a sequence GNU Radio's reconfiguration API is meant to
+        # be used in.
+        if self._signal_view_window is not None:
+            self._signal_view_window.close()
         if self.mw is not None:
             self.mw.stop()
             self.mw = None
@@ -3218,6 +4508,70 @@ class CanvasWindow(QtWidgets.QMainWindow):
         self.stop_button.setEnabled(False)
         self.validate_button.setEnabled(True)
         self.clear_button.setEnabled(True)
+        self.inspector.refresh_after_run_state_change()
+
+    def _open_pending_signal_views(self):
+        """Opens ONE SignalViewWindow holding every output port ticked
+        in the inspector (NodeItem/EdgeItem.signal_probe_ports -- see
+        either class's own comment, and NodeInspector._add_signal_
+        checkboxes_for()) as a stacked row apiece -- not a separate
+        window per port, per explicit feedback asking for a single
+        GNU-Radio-Companion-style window instead of one popup per tick.
+        Called from on_start(), right after self.mw is built but BEFORE
+        self.mw.start() actually launches the flowgraph.
+
+        That ordering is the actual fix for a real, separate problem
+        from the single-window one: the first version of this feature
+        opened a tap on demand, while already running, which calls
+        SignalProbe's own tb.lock()/connect()/tb.unlock(). Locking an
+        already-RUNNING top_block briefly pauses its scheduler so you
+        can safely reconfigure it, and that pause is exactly what showed
+        up as the simulation visibly freezing/stuttering every time a
+        signal view was opened mid-run. Doing every tap here instead --
+        before mw.start() -- means tb.lock()/unlock() only ever run
+        against a flowgraph that hasn't started scheduling yet, so there
+        is nothing running to pause.
+
+        self.mw.nodes is already fully populated at this point (built
+        during TopologyMiddleware.__init__, before its own start()
+        method does anything) -- that's what makes connecting here, one
+        call ahead of self.mw.start(), both possible and safe. Opens
+        nothing at all if nothing is ticked, rather than an empty window."""
+        pending = []  # (node_id, type_name, port_name, title)
+        for node_item in self.nodes.values():
+            for port_name in sorted(node_item.signal_probe_ports):
+                pending.append((node_item.node_id, node_item.type_name, port_name,
+                                 f"{node_item.node_id} / {port_name}"))
+        for edge_item in self.edges:
+            if edge_item.live_channel_id and "out" in edge_item.signal_probe_ports:
+                title = (f"channel {edge_item.from_node.node_id}"
+                         f"→{edge_item.to_node.node_id} / out")
+                pending.append((edge_item.live_channel_id, "channel", "out", title))
+        if not pending:
+            return
+
+        win = SignalViewWindow(on_closed=self._on_signal_view_closed)
+        opened_any = False
+        for node_id, type_name, port_name, title in pending:
+            if self.mw is None or node_id not in self.mw.nodes:
+                continue  # defensive -- self.mw is always set by the time this runs
+            try:
+                probe = SignalProbe(self.mw, node_id, type_name, port_name)
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(self, "Can't view signal", f"{title}: {e}")
+                continue
+            win.add_probe(title, probe)
+            opened_any = True
+        if opened_any:
+            self._signal_view_window = win
+            win.show()
+
+    def _on_signal_view_closed(self, win):
+        """SignalViewWindow's on_closed callback -- clears the tracked
+        reference regardless of which side closed it first (the user
+        closing the window, or on_stop() force-closing it)."""
+        if self._signal_view_window is win:
+            self._signal_view_window = None
 
     def on_clear(self):
         if self.mw is not None:
@@ -3225,6 +4579,7 @@ class CanvasWindow(QtWidgets.QMainWindow):
         self.view.scene().clear()
         self.nodes = {}
         self.edges = []
+        self.wake_range_items = []  # scene.clear() already deleted these Qt objects
         self._node_counter = defaultdict(int)
         self.inspector.show_node(None)
 

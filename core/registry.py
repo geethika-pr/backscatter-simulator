@@ -282,7 +282,6 @@ NODE_TYPES = {
         params=[
             Param("bit_rate", 10000, basic=True, label="Bit Rate"),
             Param("si_enable", 1, basic=True, label="Enable Self-Interference Cancellation"),
-            Param("threshold", 0.02, basic=False, label="Slicer Threshold"),
             # dc_len: exposed for consistency with rx_ook/rx_bpsk (same
             # Tier-1 edit, same dc_blocker_cc underneath) -- FM0 doesn't
             # actually NEED this lever day to day. Its self-clocking
@@ -294,6 +293,16 @@ NODE_TYPES = {
             # it's available to experiment with if a future edge case
             # ever needs it.
             Param("dc_len", 1024, basic=True, label="DC Blocker Length (samples)"),
+            # Was listed ahead of dc_len above (an advanced param sitting
+            # before a basic one) until the inspector's Advanced toggle
+            # started relying on basic params being grouped before
+            # advanced ones in each type's own list (see canvas_window.py's
+            # show_node() -- it places the toggle right before the first
+            # basic=False param it walks into). Moved below dc_len to match
+            # that grouping, same as every other NodeType here; no
+            # functional change, params are matched by name everywhere
+            # else, never by position.
+            Param("threshold", 0.02, basic=False, label="Slicer Threshold"),
             Param("si_isolation_db", 25.0, basic=False, label="SI Isolation (dB)"),
             Param("samp_rate", 2e6, basic=False, label="Sample Rate"),
             # The embedded FM0 decoder now re-syncs once per packet instead
