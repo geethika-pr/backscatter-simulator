@@ -275,6 +275,17 @@ PLACEABLE_NODE_TYPES = [t for t in registry.NODE_TYPES
                          if t not in ("tag_analog", "rx_analog", "pie_decoder",
                                       "packet_hex_decoder", "channel")]
 
+# A combined "reader" -- one sender + one rx_*, treated on the canvas as a
+# single monostatic unit (see CanvasWindow.add_reader()) -- is NOT a real
+# registry.NODE_TYPES entry: it's a UI-only wrapper around two perfectly
+# ordinary nodes, same precedent as "channel" no longer being a draggable
+# block in its own right (see the comment just above). This sentinel string
+# is what the palette drags and CanvasView's drop handlers recognize to
+# trigger add_reader() instead of the normal single-node add_node() path --
+# deliberately not a key in registry.NODE_TYPES, so it can never collide
+# with a real block name.
+READER_PLACEHOLDER_TYPE = "reader"
+
 # Ports that are ALWAYS wired automatically -- either by TopologyMiddleware
 # itself (tag_*'s Data_In, from that node's "payload" entry -- see its
 # pass-1 loop/docstring) or by scene_to_topology() below (every sender's
@@ -321,10 +332,24 @@ NODE_SEED_OVERRIDES = {
     "tag_bpsk": dict(DEFAULT_TAG_OVERRIDES),
     "tag_fm0": dict(DEFAULT_TAG_OVERRIDES),
     "tag_miller": dict(DEFAULT_TAG_OVERRIDES),
-    "rx_ook": {"si_isolation_db": SI_ISOLATION_DEFAULTS["OOK"]},
-    "rx_bpsk": {"si_isolation_db": SI_ISOLATION_DEFAULTS["BPSK"]},
-    "rx_fm0": {"si_isolation_db": SI_ISOLATION_DEFAULTS["FM0"]},
-    "rx_miller": {"si_isolation_db": SI_ISOLATION_DEFAULTS["Miller"]},
+    # si_enable=0: a freshly-dropped STANDALONE rx_* now starts with
+    # self-interference cancellation off -- see the combined "reader"
+    # block's own discussion (CanvasWindow.add_reader()): a standalone
+    # receiver has no co-located sender of its own on this canvas, so
+    # there's no real self-interference for it to cancel, and the
+    # si_enable/si_isolation_db controls themselves are hidden from a
+    # standalone rx's inspector panel entirely now (see NodeInspector.
+    # show_node()). Overrides the registry's own default of 1 -- NOT a
+    # change to that default itself, just this seed, so an OLD saved
+    # layout (which carries each node's own explicit si_enable value,
+    # not just its type) is completely unaffected either way.
+    # add_reader() explicitly flips this back to 1 on the rx half of
+    # every NEW reader it creates, immediately after this seed applies,
+    # since that IS exactly the monostatic case this cancellation is for.
+    "rx_ook": {"si_isolation_db": SI_ISOLATION_DEFAULTS["OOK"], "si_enable": 0},
+    "rx_bpsk": {"si_isolation_db": SI_ISOLATION_DEFAULTS["BPSK"], "si_enable": 0},
+    "rx_fm0": {"si_isolation_db": SI_ISOLATION_DEFAULTS["FM0"], "si_enable": 0},
+    "rx_miller": {"si_isolation_db": SI_ISOLATION_DEFAULTS["Miller"], "si_enable": 0},
 }
 
 # Arbitrary canvas-to-physical scale, used only to keep a per-edge
@@ -480,6 +505,17 @@ def _check_known_requirements(nodes, edges):
 # the shape (circle, rounded square, whatever) should already be baked
 # into the png via its own transparency, since this code only ever
 # draws the pixmap as-is, it doesn't mask or crop it into a shape itself.
+#
+# One exception: a combined reader's visible half (see CanvasWindow.
+# add_reader()) is, under the hood, an ordinary 'sender' NodeItem -- but
+# it looks up "reader.png" instead of "sender.png", per explicit
+# request ("its taking the current sender image i need this to be
+# separate"), so the combined block can have its own distinct look
+# rather than being visually identical to a plain standalone sender.
+# See NodeItem's icon_type_name param (defaults to type_name for every
+# ordinary node) and the two call sites that override it: add_reader()
+# (a fresh reader) and _load_layout_dict() (one being reloaded from a
+# saved layout).
 ICON_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons")
 
 _icon_pixmap_cache = {}  # type_name -> QPixmap or None (None = looked up, missing/invalid)
@@ -710,6 +746,33 @@ class PortHandle(QtWidgets.QGraphicsEllipseItem):
             text_w = self._label.boundingRect().width()
             self._label.setPos(self.pos().x() - self.RADIUS - 3 - text_w, self.pos().y() - 7)
 
+    def set_auto_wired(self, auto_wired):
+        """Flips this ALREADY-BUILT port between normal and auto_wired
+        styling/behavior after construction -- unlike every other
+        auto_wired port (Data_In, Tx_Leakage_* -- baked in once at
+        construction time via AUTO_WIRED_PORTS, never touched again),
+        a tag's own Carrier_Out/Reflection_Out port is ordinarily a
+        completely normal, manually-connectable port. It only becomes
+        "spoken for" the moment a combined reader's one visible output
+        gets wired straight into that tag (see CanvasWindow.
+        _wire_reader_shadow_return()), and has to go back to normal
+        the instant that wire is removed (CanvasWindow._delete_edge())
+        -- both runtime transitions this constructor-time-only flag
+        couldn't express on its own."""
+        self.auto_wired = auto_wired
+        if auto_wired:
+            color = "#aaaaaa"
+            tooltip = (f"{self.port.name} ({self.port.direction}, {self.port.dtype}) -- wired "
+                       "automatically by the combined reader this tag is connected to; "
+                       "nothing to connect here")
+        else:
+            color = "#4a90d9" if self.port.direction == "out" else "#d9824a"
+            tooltip = f"{self.port.name} ({self.port.direction}, {self.port.dtype})"
+        self.setBrush(QtGui.QBrush(QtGui.QColor(color)))
+        self.setToolTip(tooltip)
+        if self._label is not None:
+            self._label.setBrush(QtGui.QBrush(QtGui.QColor("#999999" if auto_wired else "#000000")))
+
 
 class NodeItem(QtWidgets.QGraphicsRectItem):
     """One placed node on the canvas. Holds the live, editable state for
@@ -752,10 +815,19 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
     ICON_TOP_MARGIN = 6
     ICON_LABEL_H = 28  # room for the type/id text below the image
 
-    def __init__(self, node_id, type_name, canvas, pos):
+    def __init__(self, node_id, type_name, canvas, pos, icon_type_name=None):
         self.node_id = node_id
         self.type_name = type_name
         self.canvas = canvas  # CanvasWindow, used to keep edges in sync on move
+
+        # Which icon file to look up (see ICON_DIR's own comment) --
+        # normally just type_name itself (every ordinary node), but
+        # add_reader()/_load_layout_dict() pass "reader" here for a
+        # combined reader's visible sender half, so it gets its own
+        # distinct icon instead of a plain sender's. Stored (not just
+        # used inline below) so it's available if anything else ever
+        # needs to know which icon this item is actually showing.
+        self.icon_type_name = icon_type_name if icon_type_name is not None else type_name
 
         # order_seq: a monotonically increasing id, assigned once by
         # add_node() (see its own comment) and otherwise untouched for
@@ -783,6 +855,27 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         # nodes never need one.
         self.show_wake_ranges = False
         self._identity_highlight_item = None
+
+        # Combined "reader" block (see CanvasWindow.add_reader()): None
+        # for every ordinary node. For a reader, the VISIBLE node is the
+        # sender half (its one real port -- Carrier_Out -- is the ONE
+        # output this whole feature exists to expose: the user wires it
+        # straight to a tag, exactly like any other sender, and that IS
+        # the real forward leg, not a stand-in for something else);
+        # reader_partner on it points at an rx_* NodeItem that exists
+        # purely as backend bookkeeping -- same params/ports/id as any
+        # other receiver, but deliberately never added to the
+        # QGraphicsScene (see add_node()'s own add_to_scene param), so
+        # it never draws, can't be clicked or dragged, and isn't a
+        # second thing on screen to keep in sync -- the whole point,
+        # since "one block, one [output] port" was the explicit ask
+        # this fixes. reader_partner on the hidden rx itself points
+        # back at the visible sender, same link either direction. A
+        # plain tag/rx/sender outside any reader always has
+        # reader_partner=None, so every reader-specific check elsewhere
+        # in this file is a simple "is not None" test with no extra
+        # type-name branching needed.
+        self.reader_partner = None
 
         nt = registry.NODE_TYPES[type_name]
         # Auto-wired ports (Data_In, Tx_Leakage_Out/In -- see
@@ -812,7 +905,7 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         # a genuinely different shape -- narrower, ports hugging the
         # image, name below instead of a top-left header -- not just a
         # resized version of the plain-rectangle one.
-        icon_pixmap = _load_icon_pixmap(type_name)
+        icon_pixmap = _load_icon_pixmap(self.icon_type_name)
 
         if icon_pixmap is not None:
             width = self.ICON_SIZE + 2 * self.ICON_PORT_MARGIN
@@ -1169,6 +1262,26 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
         # checkbox-building code identical to show_node()'s (see
         # NodeInspector._add_signal_checkboxes_for()).
         self.signal_probe_ports = set()
+
+        # Combined-reader bookkeeping (see CanvasWindow.add_reader()/
+        # _wire_reader_shadow_return()). is_reader_shadow: True only for
+        # the invisible tag->rx return edge a reader auto-creates
+        # underneath a visible sender->tag forward edge (the ONE wire
+        # the user actually drags, straight out of the reader's one real
+        # port) -- never added to the QGraphicsScene (so it never shows
+        # as a second arrow) and never included in _serialize_layout()
+        # (it's always reconstructible from the reader_partner link +
+        # the visible forward edge, so saving it too would just double
+        # it up on the next Load). False for every normal edge,
+        # including a normal forward edge.
+        # reader_shadow: the OTHER direction -- set on a VISIBLE forward
+        # edge (sender->tag) that fed a reader, pointing at ITS own
+        # shadow return edge, so an edit to this edge's channel_params
+        # (NodeInspector._on_channel_param_changed()) can mirror onto the
+        # shadow -- "only one channel, same physical path" (see that
+        # method). None for every edge that isn't a reader's forward leg.
+        self.is_reader_shadow = False
+        self.reader_shadow = None
         # Selectable (so clicking it opens NodeInspector.show_edge(), the
         # same "click it like a block" the id/param widgets below give a
         # real node) only when it actually carries a channel -- an old
@@ -1235,6 +1348,24 @@ class NodePaletteList(QtWidgets.QListWidget):
             item = QtWidgets.QListWidgetItem(type_name)
             item.setToolTip(_node_type_tooltip(type_name))
             self.addItem(item)
+        # The combined reader (see READER_PLACEHOLDER_TYPE/CanvasWindow.
+        # add_reader()) isn't a registry.NODE_TYPES entry, so it can't go
+        # through the loop above (_node_type_tooltip() looks its argument
+        # up in registry.NODE_TYPES and would KeyError on it) -- added as
+        # its own item, with its own hand-written tooltip, instead.
+        reader_item = QtWidgets.QListWidgetItem(READER_PLACEHOLDER_TYPE)
+        reader_item.setToolTip(
+            "Combined reader: one block, one OUTPUT port. Drag this onto the "
+            "canvas -- it shows up as a single sender-looking box, one output, "
+            "no input -- then wire that one output straight to a tag's "
+            "Carrier_In with one arrow to connect both the forward "
+            "(sender-to-tag) and return (tag-to-receiver) legs at once, "
+            "sharing one measured distance, with self-interference "
+            "cancellation on by default. The receiver side has no box of its "
+            "own; edit its settings (including modulation) from the "
+            "'Receiver (this reader)' section on this same panel."
+        )
+        self.addItem(reader_item)
 
     def startDrag(self, supportedActions):
         item = self.currentItem()
@@ -1313,18 +1444,24 @@ class CanvasView(QtWidgets.QGraphicsView):
         return best
 
     def dragEnterEvent(self, event):
-        if event.mimeData().hasText() and event.mimeData().text() in registry.NODE_TYPES:
+        text = event.mimeData().text() if event.mimeData().hasText() else None
+        if text in registry.NODE_TYPES or text == READER_PLACEHOLDER_TYPE:
             event.acceptProposedAction()
 
     def dragMoveEvent(self, event):
-        if event.mimeData().hasText() and event.mimeData().text() in registry.NODE_TYPES:
+        text = event.mimeData().text() if event.mimeData().hasText() else None
+        if text in registry.NODE_TYPES or text == READER_PLACEHOLDER_TYPE:
             event.acceptProposedAction()
 
     def dropEvent(self, event):
         type_name = event.mimeData().text()
+        scene_pos = self.mapToScene(event.position().toPoint())
+        if type_name == READER_PLACEHOLDER_TYPE:
+            self.window.add_reader(scene_pos)
+            event.acceptProposedAction()
+            return
         if type_name not in registry.NODE_TYPES:
             return
-        scene_pos = self.mapToScene(event.position().toPoint())
         self.window.add_node(type_name, scene_pos)
         event.acceptProposedAction()
 
@@ -1912,6 +2049,17 @@ class NodeInspector(QtWidgets.QWidget):
                                    # show_edge()) is what's selected
         self.param_widgets = {}
         self.decoder_param_widgets = {}
+        self.reader_rx_param_widgets = {}
+        self.reader_decoder_param_widgets = {}
+        # Which NodeItem the wake-range checkbox currently edits --
+        # either a plain standalone sender (node_item itself) or a
+        # combined reader's sender half (when node_item is that
+        # reader's rx, normalized in show_node() -- see its own
+        # comment), or None when neither applies. Tracked separately
+        # from current_node because current_node is always normalized
+        # to the RX half for a reader, never the sender half, so
+        # _on_wake_range_toggled() can't just reuse current_node.
+        self._wake_range_owner = None
         # Rows currently hidden/shown by the Advanced toggle (see
         # _add_param_row()/_on_advanced_toggled() below) -- (label_widget,
         # field_widget) pairs for every row whose registry Param has
@@ -2222,6 +2370,25 @@ class NodeInspector(QtWidgets.QWidget):
         self.setEnabled(False)
 
     def show_node(self, node_item):
+        # A combined reader (see CanvasWindow.add_reader()) is visibly
+        # one node -- its hidden rx half was never added to the scene,
+        # so node_item here can actually only ever be the sender half
+        # (nothing else is clickable). The type_name.startswith("rx_")
+        # branch below is defensive/dead in practice, kept because it's
+        # harmless and cheap insurance against ever changing that. Either
+        # way, node_item ends up normalized to the sender half here,
+        # once, so every branch further down (the generic params loop,
+        # wake-range ownership) can keep treating it as a perfectly
+        # ordinary sender node, with reader_rx_item tracked separately
+        # for the modulation combo and the new "Receiver (this reader)"
+        # section added further down -- both of which are genuinely
+        # about the HIDDEN rx now, not node_item itself.
+        reader_rx_item = None
+        if node_item is not None and node_item.reader_partner is not None:
+            if node_item.type_name.startswith("rx_"):
+                node_item = node_item.reader_partner
+            reader_rx_item = node_item.reader_partner
+
         self.current_node = node_item
         self.current_edge = None
         self._clear_params_form()
@@ -2235,6 +2402,7 @@ class NodeInspector(QtWidgets.QWidget):
             self.modulation_label.setVisible(False)
             self.modulation_combo.setVisible(False)
             self.wake_range_checkbox.setVisible(False)
+            self._wake_range_owner = None
             self.payload_mode_label.setVisible(False)
             self.payload_mode_combo.setVisible(False)
             self.payload_label.setVisible(True)
@@ -2254,10 +2422,19 @@ class NodeInspector(QtWidgets.QWidget):
 
         self.setEnabled(True)
         self.id_edit.setEnabled(True)
-        self.title_label.setText(node_item.type_name)
+        self.title_label.setText(
+            f"{node_item.type_name}  (combined reader -- rx: {reader_rx_item.type_name})"
+            if reader_rx_item is not None else node_item.type_name)
         self.id_edit.setText(node_item.node_id)
 
-        modulation = TYPE_TO_MODULATION.get(node_item.type_name)
+        # Modulation selector: "a selector to choose the modulation
+        # technique for the RX" was the original ask, verbatim -- for a
+        # reader that's the hidden rx's own type, never node_item's own
+        # (node_item is the sender here, and TYPE_TO_MODULATION has no
+        # "sender" entry at all). Unaffected for a plain standalone
+        # tag_*/rx_* node, where reader_rx_item is just None.
+        modulation_source = reader_rx_item if reader_rx_item is not None else node_item
+        modulation = TYPE_TO_MODULATION.get(modulation_source.type_name)
         show_modulation = modulation is not None
         self.modulation_label.setVisible(show_modulation)
         self.modulation_combo.setVisible(show_modulation)
@@ -2268,11 +2445,19 @@ class NodeInspector(QtWidgets.QWidget):
                 self.modulation_combo.setCurrentIndex(idx)
             self._updating_modulation_combo = False
 
+        # "Show tag wake-up ranges" lives conceptually on a SENDER
+        # (show_wake_ranges, see that checkbox's own comment) -- node_
+        # item IS always the sender half now, whether standalone or a
+        # reader's visible half (see the normalization at the top of
+        # this method), so this no longer needs a separate reader case
+        # at all: it's just "is this a sender", full stop.
         is_sender = node_item.type_name == "sender"
-        self.wake_range_checkbox.setVisible(is_sender)
-        if is_sender:
+        self._wake_range_owner = node_item if is_sender else None
+        show_wake_range_ui = is_sender
+        self.wake_range_checkbox.setVisible(show_wake_range_ui)
+        if show_wake_range_ui:
             self.wake_range_checkbox.blockSignals(True)
-            self.wake_range_checkbox.setChecked(node_item.show_wake_ranges)
+            self.wake_range_checkbox.setChecked(self._wake_range_owner.show_wake_ranges)
             self.wake_range_checkbox.blockSignals(False)
 
         is_tag = node_item.payload is not None
@@ -2340,11 +2525,28 @@ class NodeInspector(QtWidgets.QWidget):
         # opening/switching a receiver immediately show the truth, no
         # Validate/Start required first. notify=False -- this call IS
         # the refresh, so it must not also trigger show_node again.
-        if node_item.decoder_params is not None:
+        # For a reader, this is about the HIDDEN rx's decoder config, not
+        # node_item's own (node_item is the sender here, decoder_params
+        # is always None for a sender) -- redirected to reader_rx_item.
+        decoder_sync_target = reader_rx_item if reader_rx_item is not None else node_item
+        if decoder_sync_target.decoder_params is not None:
             self.window._sync_decoder_params(
-                node_item, self.window._find_upstream_tags(node_item), notify=False)
+                decoder_sync_target, self.window._find_upstream_tags(decoder_sync_target),
+                notify=False)
 
         nt = registry.NODE_TYPES[node_item.type_name]
+        # "Transmission Settings" header -- ONLY for a reader (node_item
+        # is always its sender half here), so the panel reads as two
+        # clearly separated sets of knobs: this sender's own settings
+        # right below, then "Receiver Settings (this reader)" further
+        # down for the hidden rx's. A plain standalone sender has
+        # nothing to separate its params FROM on this same panel, so it
+        # keeps today's header-less look -- modulation combo/wake-range
+        # tick/Gated Mode all stay exactly where they already are either
+        # way, per explicit request ("its okay to keep the modulation
+        # technique wakeup tick, gated mode etc on the top").
+        if reader_rx_item is not None:
+            self._add_section_header("Transmission Settings")
         # Where the Advanced toggle lands in THIS type's params: right
         # after "Gated Mode" (enable_gated) for the types that have one
         # (every tag_* type plus sender) -- by explicit request, even
@@ -2355,6 +2557,21 @@ class NodeInspector(QtWidgets.QWidget):
         # generic rule instead: right before the first basic=False row.
         advanced_toggle_inserted = False
         for p in nt.params:
+            # Self-interference cancellation is meaningless for a
+            # STANDALONE rx (no co-located sender of its own on this
+            # canvas to self-interfere with) -- hidden here entirely per
+            # explicit request, rather than just defaulted off (see
+            # NODE_SEED_OVERRIDES' own comment on the new si_enable=0
+            # seed this pairs with). node_item can never be a reader's
+            # rx at this point (it's always normalized to the sender
+            # half above), so "node_item is a standalone rx" and "hide
+            # SI" are exactly the same condition now -- a reader's own
+            # si_enable/si_isolation_db are shown normally, just in the
+            # separate "Receiver (this reader)" section below instead,
+            # since that's exactly the monostatic case this cancellation
+            # exists for.
+            if p.name in ("si_enable", "si_isolation_db") and node_item.type_name.startswith("rx_"):
+                continue
             widget = self._make_param_widget(p.name, node_item.params.get(p.name, p.default))
             if p.name == "enable_gated":
                 self._add_inline_checkbox_row(p.label or p.name, widget)
@@ -2370,19 +2587,32 @@ class NodeInspector(QtWidgets.QWidget):
         if not advanced_toggle_inserted:
             self._insert_advanced_toggle_row()
 
-        # Decoder settings, for rx_* nodes only -- same form, same tab,
-        # right below this receiver's own params (see decoder_params'
-        # comment on NodeItem: no longer a separate node or a global
-        # tab, it's this ONE receiver's own decode config now, the same
-        # way "two receivers might need two payload lengths" actually
-        # works). bit_rate/samp_rate stay disabled: scene_to_topology()
-        # derives those two per receiver regardless of what's set here
-        # (see its comment -- a wrong value there doesn't error, it
-        # silently decodes nothing, the already-diagnosed FM0/Miller
-        # failure mode), so showing them as editable here would be a lie.
+        # Decoder settings, for a STANDALONE rx_* node only -- same form,
+        # same tab, right below this receiver's own params (see
+        # decoder_params' comment on NodeItem: no longer a separate node
+        # or a global tab, it's this ONE receiver's own decode config
+        # now, the same way "two receivers might need two payload
+        # lengths" actually works). For a reader, node_item is the
+        # sender (decoder_params is always None for it), so this block
+        # naturally doesn't fire -- the reader's own decoder settings
+        # live in the "Receiver (this reader)" section below instead,
+        # which reuses this exact same per-param logic against
+        # reader_rx_item. bit_rate/samp_rate stay disabled:
+        # scene_to_topology() derives those two per receiver regardless
+        # of what's set here (see its comment -- a wrong value there
+        # doesn't error, it silently decodes nothing, the
+        # already-diagnosed FM0/Miller failure mode), so showing them as
+        # editable here would be a lie.
+        # Defined here, unconditionally, rather than inside either branch
+        # below -- both the standalone-rx block right below AND the
+        # reader's own "Decoder (this reader's receiver)" block further
+        # down need it, and for a reader node_item.decoder_params is
+        # always None (node_item is the sender), so the dnt assignment
+        # that used to live inside that first `if` would never run at
+        # all when it's the second block that actually needs it.
+        dnt = registry.NODE_TYPES["packet_hex_decoder"]
         if node_item.decoder_params is not None:
             self.params_form.addRow(QtWidgets.QLabel("<b>Decoder (this receiver)</b>"))
-            dnt = registry.NODE_TYPES["packet_hex_decoder"]
             for p in dnt.params:
                 # FM0/Miller now carry their OWN payload_len/preamble
                 # params (see registry.py's comment on rx_fm0/rx_miller --
@@ -2424,10 +2654,87 @@ class NodeInspector(QtWidgets.QWidget):
                 self._add_param_row(p.label or p.name, widget, not p.basic)
                 self.decoder_param_widgets[p.name] = widget
 
+        # "Receiver Settings (this reader)" -- the OTHER half of a
+        # combined reader, rendered right here as its own small section
+        # rather than a separate panel, with a divider line ahead of its
+        # header (see _add_section_header()) so it reads as a clearly
+        # separate block from "Transmission Settings" above -- per
+        # explicit request to clearly separate the two on this one panel
+        # that shows both. Includes its modulation-specific params AND
+        # si_enable/si_isolation_db -- unlike a standalone rx's panel,
+        # these are never hidden here, since a reader's own rx is
+        # exactly the monostatic case self-interference cancellation
+        # exists for. Same generic registry-driven loop as the main
+        # params loop above, just writing into reader_rx_item.params
+        # (via _on_reader_rx_param_changed) instead of node_item's own,
+        # and piggy-backing on the ONE Advanced toggle already inserted
+        # above rather than adding a second toggle button for it (same
+        # reuse the Decoder section above already relies on).
+        if reader_rx_item is not None:
+            self._add_section_header("Receiver Settings (this reader)")
+            rnt = registry.NODE_TYPES[reader_rx_item.type_name]
+            for p in rnt.params:
+                widget = make_param_widget(
+                    p.name, reader_rx_item.params.get(p.name, p.default),
+                    self._on_reader_rx_param_changed)
+                self._add_param_row(p.label or p.name, widget, not p.basic)
+                self.reader_rx_param_widgets[p.name] = widget
+
+            # This reader's own decoder settings -- same per-param logic
+            # as the standalone-rx "Decoder (this receiver)" block above
+            # (bit_rate/samp_rate disabled, FM0/Miller's own payload_len/
+            # preamble deduped against reader_rx_item.params instead of
+            # node_item's), just targeting the hidden rx and writing
+            # through _on_reader_decoder_param_changed instead.
+            if reader_rx_item.decoder_params is not None:
+                self.params_form.addRow(QtWidgets.QLabel("<b>Decoder (this reader's receiver)</b>"))
+                for p in dnt.params:
+                    if p.name == "payload_len_bits" and "payload_len" in reader_rx_item.params:
+                        continue
+                    if p.name == "preamble" and "preamble" in reader_rx_item.params:
+                        continue
+                    widget = make_param_widget(
+                        p.name, reader_rx_item.decoder_params.get(p.name, p.default),
+                        self._on_reader_decoder_param_changed)
+                    if p.name in ("bit_rate", "samp_rate"):
+                        widget.setEnabled(False)
+                        widget.setToolTip(
+                            "Derived automatically for this receiver (see "
+                            "scene_to_topology()'s decoder auto-wiring) -- OOK/BPSK and "
+                            "FM0/Miller need different values here, so it's not something "
+                            "to set by hand. Edit bit rate on the tag or this reader's "
+                            "receiver section above instead."
+                        )
+                    elif p.name == "preamble":
+                        widget.setToolTip(
+                            "What this receiver's decoder hunts for, AND what every "
+                            "upstream tag actually transmits -- plan_topology() resolves "
+                            "each tag's preamble by walking forward to its own receiver's "
+                            "decoder, so editing it here changes both sides of the match "
+                            "consistently."
+                        )
+                    self._add_param_row(p.label or p.name, widget, not p.basic)
+                    self.reader_decoder_param_widgets[p.name] = widget
+
         port_descriptions = ", ".join(f"{p.name} ({p.direction}/{p.dtype})" for p in nt.ports)
-        self.ports_label.setText(f"Ports: {port_descriptions}")
+        if reader_rx_item is not None:
+            rx_port_descriptions = ", ".join(
+                f"{p.name} ({p.direction}/{p.dtype})" for p in registry.NODE_TYPES[reader_rx_item.type_name].ports)
+            self.ports_label.setText(
+                f"Ports (this block): {port_descriptions}\n"
+                f"Ports (hidden receiver): {rx_port_descriptions}")
+        else:
+            self.ports_label.setText(f"Ports: {port_descriptions}")
 
         self._add_signal_checkboxes_for(node_item.type_name, node_item, node_item.node_id)
+        if reader_rx_item is not None:
+            # So "View signal: Data_Out" (the decoded bitstream) is still
+            # reachable for a reader, same as it always was when the rx
+            # itself used to be the visible half -- this is the one
+            # capability that would otherwise quietly disappear by only
+            # ever building checkboxes for node_item's own ports.
+            self._add_signal_checkboxes_for(
+                reader_rx_item.type_name, reader_rx_item, reader_rx_item.node_id)
 
     def show_edge(self, edge_item):
         """The per-tag channel living on a sender->tag_* or tag_*->rx_*
@@ -2453,6 +2760,7 @@ class NodeInspector(QtWidgets.QWidget):
         self.modulation_label.setVisible(False)
         self.modulation_combo.setVisible(False)
         self.wake_range_checkbox.setVisible(False)
+        self._wake_range_owner = None
         self.payload_mode_label.setVisible(False)
         self.payload_mode_combo.setVisible(False)
         self.payload_label.setVisible(False)
@@ -2521,6 +2829,8 @@ class NodeInspector(QtWidgets.QWidget):
             self.params_form.removeRow(0)
         self.param_widgets = {}
         self.decoder_param_widgets = {}
+        self.reader_rx_param_widgets = {}
+        self.reader_decoder_param_widgets = {}
         # The form was just torn down -- every row in it, including any
         # advanced ones, is gone, so the tracking list has to start empty
         # again too (the rebuild below repopulates it).
@@ -2657,6 +2967,42 @@ class NodeInspector(QtWidgets.QWidget):
         row_layout.addStretch(1)
         self.params_form.addRow(row_widget)
 
+    def _add_section_header(self, text):
+        """Adds one bold section-header row to params_form -- "Transmission
+        Settings" vs "Receiver Settings" on a combined reader's panel,
+        by explicit request ("clearly separate the transmission
+        settings and reciver settings ... configurable settings clearly
+        separate them on the panel"). A thin horizontal divider line
+        goes in first (except when this is the very first row in the
+        form), so the break between one section's last param and the
+        next section's header reads as a clear seam, not just a change
+        in label styling -- same "clear visual break" spirit as the
+        energy group's own divider between its editable inputs and its
+        computed results, just reused here across params_form's
+        sections instead of inside one QGroupBox.
+
+        Deliberately NOT a QGroupBox: every row in params_form shares
+        ONE QFormLayout (see its own setRowWrapPolicy() comment), and
+        the Advanced toggle/decoder sub-sections already use a plain
+        bold addRow(QLabel(...)) row as a section marker inside that
+        same form -- this keeps the same lightweight pattern rather than
+        restructuring into several nested layouts.
+
+        Centered (AlignCenter), not left-aligned like every other row's
+        label/field -- per explicit follow-up feedback ("make the 2
+        titles transmit and receiver centered it doesnt look like a
+        title"): a plain left-aligned label here reads as just another
+        field label, in line with the params below it, rather than as a
+        heading over its own section."""
+        if self.params_form.rowCount() > 0:
+            divider = QtWidgets.QFrame()
+            divider.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+            divider.setFrameShadow(QtWidgets.QFrame.Shadow.Sunken)
+            self.params_form.addRow(divider)
+        label = QtWidgets.QLabel(f"<b>{text}</b>")
+        label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.params_form.addRow(label)
+
     def _update_advanced_toggle_text(self):
         self.advanced_toggle_button.setText(
             "Hide advanced parameters ▲" if self._show_advanced
@@ -2674,9 +3020,36 @@ class NodeInspector(QtWidgets.QWidget):
         if self.current_node is not None and self.current_node.decoder_params is not None:
             self.current_node.decoder_params[name] = value
 
+    def _on_reader_rx_param_changed(self, name, value):
+        """Edits the OTHER half of a combined reader -- the hidden rx's
+        own params dict -- from the "Receiver (this reader)" section in
+        show_node(). self.current_node is always normalized to the
+        sender half for a reader (see show_node()'s own comment), so
+        this can't just reuse _on_param_changed(); it writes through
+        current_node.reader_partner instead."""
+        if self.current_node is not None and self.current_node.reader_partner is not None:
+            self.current_node.reader_partner.params[name] = value
+            # si_enable/bit_rate and friends don't feed _wake_up_radius_m()
+            # the way tx_power_send does, but refreshing unconditionally
+            # here is cheap and matches _on_param_changed()'s own
+            # "just always refresh" reasoning rather than special-casing
+            # which of the rx's own param names would actually matter.
+            self.window._update_wake_ranges()
+
+    def _on_reader_decoder_param_changed(self, name, value):
+        """Edits the OTHER half of a combined reader -- the hidden rx's
+        own decoder_params dict -- from the "Decoder (this reader's
+        receiver)" section in show_node(). Mirrors _on_decoder_param_
+        changed() exactly, just through current_node.reader_partner
+        instead of current_node itself, same reasoning as _on_reader_rx_
+        param_changed() right above."""
+        if (self.current_node is not None and self.current_node.reader_partner is not None
+                and self.current_node.reader_partner.decoder_params is not None):
+            self.current_node.reader_partner.decoder_params[name] = value
+
     def _on_wake_range_toggled(self, checked):
-        if self.current_node is not None and self.current_node.type_name == "sender":
-            self.current_node.show_wake_ranges = checked
+        if self._wake_range_owner is not None:
+            self._wake_range_owner.show_wake_ranges = checked
             self.window._update_wake_ranges()
 
     def _on_param_changed(self, name, value):
@@ -2735,7 +3108,19 @@ class NodeInspector(QtWidgets.QWidget):
     def _on_modulation_changed(self, text):
         if self._updating_modulation_combo or self.current_node is None:
             return
-        self.window._convert_node_modulation(self.current_node, text)
+        # For a reader, this combo is showing (and editing) the HIDDEN
+        # rx's modulation, not current_node's own -- current_node is
+        # always the sender half here (see show_node()'s normalization),
+        # and _convert_node_modulation() only knows how to rebuild a
+        # tag_*/rx_* node in the first place (TYPE_TO_MODULATION has no
+        # "sender" entry, so passing current_node itself for a reader
+        # would silently do nothing -- findText() on the combo wouldn't
+        # even have matched a modulation to show it in the first place
+        # if that were the target).
+        target = self.current_node
+        if target.type_name == "sender" and target.reader_partner is not None:
+            target = target.reader_partner
+        self.window._convert_node_modulation(target, text)
 
     def _on_payload_changed(self):
         if self.current_node is None:
@@ -3103,17 +3488,33 @@ class CanvasWindow(QtWidgets.QMainWindow):
         # captured.
         self._clipboard = None
 
-        central = QtWidgets.QWidget()
-        self.setCentralWidget(central)
-        outer = QtWidgets.QHBoxLayout(central)
+        # Palette / canvas / inspector used to be three fixed-proportion
+        # panes in one QHBoxLayout -- which is exactly why the right
+        # panel could never be resized by hand: a plain layout has no
+        # drag handle between its widgets. Per explicit request ("make
+        # the right panel horizontally resizable like with canvas let
+        # the canvas shrink too... the only way to see them is to horiz
+        # scroll on the right panel i need to be able to resize it"),
+        # this is now one QSplitter instead -- every boundary (palette/
+        # canvas and canvas/inspector) gets a draggable handle, and
+        # QSplitter IS a QWidget, so it can be the central widget
+        # directly, no extra container needed.
+        self.main_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        self.setCentralWidget(self.main_splitter)
 
         palette_box = QtWidgets.QGroupBox("Node palette (drag onto canvas)")
         palette_layout = QtWidgets.QVBoxLayout(palette_box)
         self.palette_list = NodePaletteList()
         palette_layout.addWidget(self.palette_list)
-        outer.addWidget(palette_box, 0)
+        self.main_splitter.addWidget(palette_box)
 
-        center_col = QtWidgets.QVBoxLayout()
+        # A plain QVBoxLayout (as this used to be) can't be addWidget()'d
+        # onto a QSplitter -- a splitter pane has to be an actual widget
+        # -- so it's wrapped in one bare QWidget now purely to give the
+        # toolbar+canvas column a single widget identity; nothing about
+        # the layout itself (or anything added to it below) changes.
+        center_widget = QtWidgets.QWidget()
+        center_col = QtWidgets.QVBoxLayout(center_widget)
 
         toolbar = QtWidgets.QHBoxLayout()
         self.validate_button = QtWidgets.QPushButton("Validate")
@@ -3150,9 +3551,14 @@ class CanvasWindow(QtWidgets.QMainWindow):
         center_col.addLayout(toolbar)
 
         self.view = CanvasView(self)
+        # A small (not large) explicit floor -- purely so dragging the
+        # new splitter handle can't shrink the canvas all the way to
+        # nothing; still lets it shrink a lot, which is the whole point
+        # of the ask (room for a much wider inspector panel).
+        self.view.setMinimumWidth(200)
         center_col.addWidget(self.view, 1)
 
-        outer.addLayout(center_col, 1)
+        self.main_splitter.addWidget(center_widget)
 
         # Decoded-packet display: one QDockWidget per receiver (NOT a
         # plain QTableWidget any more, and deliberately not a plain
@@ -3183,7 +3589,30 @@ class CanvasWindow(QtWidgets.QMainWindow):
         self.inspector = NodeInspector(self)
         self.right_tabs = QtWidgets.QTabWidget()
         self.right_tabs.addTab(self.inspector, "Block")
-        outer.addWidget(self.right_tabs, 0)
+        self.main_splitter.addWidget(self.right_tabs)
+
+        # Stretch factors: resizing the whole window grows/shrinks the
+        # canvas pane (index 1) first, leaving the palette and inspector
+        # at whatever width their own handle was last dragged to -- same
+        # "the canvas is the thing that should flex" intent the old
+        # outer.addLayout(center_col, 1) stretch factor expressed, just
+        # on a splitter now instead of a plain layout. Every handle
+        # stays freely draggable regardless of this, including narrower/
+        # wider than its current width, down to each pane's own
+        # setMinimumWidth() floor (palette_box has none; self.view's is
+        # 200; NodeInspector's is 300 -- see their own setMinimumWidth()
+        # calls). No explicit setSizes() call here on purpose -- before
+        # this window is ever shown, the splitter has no real geometry
+        # yet, so a pixel-size call made this early is silently a no-op
+        # (confirmed directly: sizes() right after one came back
+        # unchanged); Qt's own first real layout pass, driven by these
+        # stretch factors plus each pane's sizeHint/minimumWidth, already
+        # produces a perfectly reasonable starting split (palette/canvas/
+        # inspector roughly 225/majority/300+ once shown) with no dead
+        # code needed to get there.
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setStretchFactor(2, 0)
 
         self.view.scene().selectionChanged.connect(self.on_selection_changed)
 
@@ -3225,8 +3654,26 @@ class CanvasWindow(QtWidgets.QMainWindow):
     def add_node(self, type_name, scene_pos, node_id=None, params=None, payload=None,
                  decoder_params=None, payload_mode=None, message_text=None, chunk_bytes=None,
                  file_bytes=None, file_name=None, order_seq=None,
-                 energy_per_bit=None, energy_static_rate=None):
-        """node_id/params/payload/decoder_params/payload_mode/message_text/
+                 energy_per_bit=None, energy_static_rate=None, add_to_scene=True,
+                 icon_type_name=None):
+        """add_to_scene=False creates the NodeItem and registers it in
+        self.nodes (so scene_to_topology()/save-load/Tx_Leakage wiring
+        all still see it) WITHOUT ever calling scene().addItem() on it --
+        used only for a combined reader's hidden RX half (see
+        add_reader()): it never draws, can't be clicked, dragged, or
+        rubber-band-selected, since none of that is possible for an item
+        that was never added to any QGraphicsScene. Every other caller
+        leaves this at the default True.
+
+        icon_type_name: passed straight through to NodeItem (see its own
+        comment) -- None (the default) for every ordinary node just
+        means "look up the icon under my own type_name", the same as
+        always. add_reader() passes "reader" here for the sender half
+        it creates, and _load_layout_dict() does the same when reloading
+        one from a saved layout, so a combined reader's visible block
+        can use its own icon file instead of a plain sender's.
+
+        node_id/params/payload/decoder_params/payload_mode/message_text/
         chunk_bytes/file_bytes/file_name let _load_layout_dict() recreate
         a saved node exactly (same id, same edited values) instead of
         getting a fresh auto-id and NODE_SEED_OVERRIDES-only params --
@@ -3250,7 +3697,7 @@ class CanvasWindow(QtWidgets.QMainWindow):
             while node_id in self.nodes:
                 self._node_counter[type_name] += 1
                 node_id = f"{type_name}{self._node_counter[type_name]}"
-        item = NodeItem(node_id, type_name, self, scene_pos)
+        item = NodeItem(node_id, type_name, self, scene_pos, icon_type_name=icon_type_name)
         if order_seq is not None:
             item.order_seq = order_seq
             self._next_order_seq = max(self._next_order_seq, order_seq + 1)
@@ -3277,10 +3724,95 @@ class CanvasWindow(QtWidgets.QMainWindow):
             item.energy_per_bit = energy_per_bit
         if energy_static_rate is not None and item.energy_static_rate is not None:
             item.energy_static_rate = energy_static_rate
-        self.view.scene().addItem(item)
+        if add_to_scene:
+            self.view.scene().addItem(item)
         self.nodes[node_id] = item
         self.status.showMessage(f"Added {type_name} as '{node_id}'", 3000)
         return item
+
+    READER_DEFAULT_RX_TYPE = "rx_bpsk"
+
+    def add_reader(self, scene_pos, rx_type_name=None):
+        """Places a combined "reader" as ONE visible block with ONE
+        connectable port -- per explicit correction (second one on this
+        feature): the first fix made the VISIBLE node the rx half, which
+        put the rx's own Antenna_In/Data_Out on screen -- an input AND
+        an output, neither of which is the one wire this block is
+        actually for. Verbatim: "I need one output port from this
+        special block! that goen into the tag that is the sender - tag
+        channel ... THERE SHOULD ONLY BE ONE FUCKING CHANNEL AND THAT
+        SHOULSD GO FROM THE READER (SENDER) to tag". The visible half
+        has to BE the sender, not the rx -- this is that fix.
+
+        What's actually on the canvas is a single, perfectly ordinary
+        'sender' NodeItem (same box, same one real port -- Carrier_Out,
+        since Tx_Leakage_Out is already excluded from display for every
+        sender, reader or not, see AUTO_WIRED_PORTS -- as any standalone
+        sender; no input port at all, since sender has none) with a
+        custom id ("reader1", "reader2", ... -- its own counter bucket,
+        so it never collides with or looks like a plain "sender1"). Its
+        `reader_partner` points at a SECOND, ordinary rx_* NodeItem that
+        is fully real (same params, same registry type, participates in
+        self.nodes/scene_to_topology()/save-load exactly like any other
+        node) but is created with add_to_scene=False -- it is
+        deliberately NEVER added to the QGraphicsScene, so it never
+        draws, can't be clicked, dragged, or rubber-band-selected. There
+        is no second box to keep in sync, because there is no second box.
+
+        Wiring this reader's one visible output straight to a tag's
+        Carrier_In is then EXACTLY the same single gesture as wiring any
+        other sender -- and it IS the real forward (sender->tag) leg,
+        not something synthesized; _edge_channel_role() already
+        classifies it that way on its own. _wire_reader_shadow_return()
+        (see add_edge()) is what auto-creates the matching tag->rx
+        return edge underneath as an invisible "shadow" EdgeItem the
+        instant that forward edge is drawn, and update_edges_for_node()
+        mirrors the visible forward edge's own channel_params (distance
+        included) onto it -- so both legs always share the exact same
+        one measured distance, with nothing for the user to separately
+        wire or for two different node positions to ever disagree
+        about. The tag's own output port gets greyed out
+        (PortHandle.set_auto_wired()) the moment that shadow exists, so
+        there's no way to also hand-wire a second, conflicting return
+        leg from it.
+
+        NodeInspector.show_node() renders the hidden rx's own params
+        (including si_enable/si_isolation_db -- shown here, unlike on a
+        standalone rx) as a "Receiver Settings (this reader)" section,
+        plus its modulation selector, right on this same panel, clearly
+        separated from this sender's own "Transmission Settings" section
+        above it -- per explicit request, since this is the one panel
+        that shows both sets of knobs together.
+        scene_to_topology()'s re-scoped Tx_Leakage loop wires this
+        sender's leakage straight into its own hidden rx and nowhere
+        else. si_enable is forced back on for the rx (NODE_SEED_
+        OVERRIDES now defaults every FRESH standalone rx to si_enable=0
+        -- see its own comment -- since a reader's own rx is exactly the
+        case that still needs it).
+
+        icon_type_name="reader" below -- the visible sender half uses
+        its own icon file (ICON_DIR's own comment), separate from a
+        plain standalone sender's, per explicit request ("its taking
+        the current sender image i need this to be separate")."""
+        rx_type_name = rx_type_name or self.READER_DEFAULT_RX_TYPE
+        self._node_counter["reader"] += 1
+        reader_id = f"reader{self._node_counter['reader']}"
+        while reader_id in self.nodes:
+            self._node_counter["reader"] += 1
+            reader_id = f"reader{self._node_counter['reader']}"
+        sender_item = self.add_node(
+            "sender", scene_pos, node_id=reader_id, icon_type_name="reader")
+        rx_item = self.add_node(
+            rx_type_name, scene_pos, node_id=f"{reader_id}_rx", add_to_scene=False)
+        rx_item.params["si_enable"] = 1
+        rx_item.reader_partner = sender_item
+        sender_item.reader_partner = rx_item
+        self.status.showMessage(
+            f"Added combined reader '{reader_id}'. Wire its one output straight to a tag's "
+            "Carrier_In to connect both the forward and return legs at once.",
+            6000,
+        )
+        return sender_item, rx_item
 
     def add_edge(self, from_node, from_port_name, to_node, to_port_name):
         if from_node is to_node:
@@ -3290,7 +3822,92 @@ class CanvasWindow(QtWidgets.QMainWindow):
         self.view.scene().addItem(edge)
         self.edges.append(edge)
         self._update_wake_ranges()
+        if edge.role == "forward" and from_node.reader_partner is not None:
+            # A reader's one visible output wired straight into a tag --
+            # see add_reader()'s own docstring. from_node is the reader's
+            # visible sender; from_node.reader_partner is its hidden rx.
+            #
+            # Wire the hidden return leg FIRST, before checking the
+            # modulation auto-match -- _maybe_auto_match_reader_
+            # modulation() depends on _find_upstream_tags(rx_item)
+            # finding exactly one tag, and that walks self.edges for a
+            # real tag->rx connection; without the shadow existing yet,
+            # it would see 0, not 1, and the auto-match would never
+            # fire. This ordering is safe (doesn't need "return None"
+            # the way an earlier version of this did): if the auto-match
+            # below DOES fire, it rebuilds the rx (CanvasWindow._convert_
+            # node_modulation()'s delete-and-recreate) -- but that method
+            # now explicitly re-derives a fresh shadow for whichever
+            # forward edge still feeds the rebuilt rx afterward (see its
+            # own reader_partner handling), rather than trying to carry
+            # the edge created here through the rebuild. `edge` itself
+            # is never deleted by an rx-only rebuild (neither of its own
+            # endpoints is the rx), so it stays the same live object,
+            # and edge.reader_shadow ends up correctly re-pointed at
+            # the NEW shadow either way.
+            self._wire_reader_shadow_return(edge)
+            self._maybe_auto_match_reader_modulation(from_node.reader_partner, to_node)
         return edge
+
+    def _wire_reader_shadow_return(self, forward_edge):
+        """A reader's one visible output (forward_edge.from_node) just
+        got wired straight into a tag (forward_edge.to_node) -- see
+        add_reader()'s own docstring. Since that reader's own rx IS the
+        thing meant to hear this same tag's backscatter (there's no
+        separate choice to make by hand for a monostatic unit), this
+        auto-creates the matching tag->rx return edge underneath: a
+        perfectly normal EdgeItem, role="return", own channel_params --
+        scene_to_topology() builds its channel exactly like any visible
+        return edge (it just reads self.edges, which this is appended
+        to) -- except it's deliberately NEVER added to the
+        QGraphicsScene, so only the ONE arrow the user actually dragged
+        (the sender->tag forward edge) ever appears on screen. Also
+        greys out the tag's own output port (PortHandle.set_auto_wired())
+        so it can't be dragged from again while wired into a reader --
+        the user's own explicit ask, to head off wiring that same tag's
+        output to something else by mistake once a reader already
+        claims it. (Note: it's the PORT that gets greyed, not this edge
+        or the visible forward edge -- a plain, fully normal-colored
+        channel edge is exactly what the one wire the user drew should
+        look like.)"""
+        rx = forward_edge.from_node.reader_partner
+        tag = forward_edge.to_node
+        if not tag.out_ports or not rx.in_ports:
+            return
+        out_port, in_port = tag.out_ports[0].name, rx.in_ports[0].name
+        if self._edge_exists(tag, out_port, rx, in_port):
+            return
+        shadow = EdgeItem(tag, out_port, rx, in_port)
+        shadow.is_reader_shadow = True
+        self.edges.append(shadow)  # deliberately never scene().addItem()'d -- see docstring
+        forward_edge.reader_shadow = shadow
+        if tag.out_ports:
+            out_handle = tag.port_handles.get(("out", tag.out_ports[0].name))
+            if out_handle is not None:
+                out_handle.set_auto_wired(True)
+        self._update_wake_ranges()
+
+    def _maybe_auto_match_reader_modulation(self, rx_item, tag_item):
+        """Wiring the FIRST tag into a combined reader's rx auto-
+        switches that rx's own modulation to match the tag's -- per
+        explicit decision (most of the time that's exactly what would
+        get picked by hand anyway), returning True iff it actually
+        triggered a switch. A one-time nudge, not a standing link: a
+        SECOND, differently-modulated tag wired into the same reader
+        later does NOT re-switch it back and forth -- _find_upstream_
+        tags() already handles a receiver with mixed-modulation tags
+        feeding it the same as it always has, and that's the signal
+        used here to tell "first tag" apart from "another tag" -- the
+        edge being checked is already in self.edges by the time this
+        runs (see add_edge()), so a count of exactly 1 means this one."""
+        if len(self._find_upstream_tags(rx_item)) != 1:
+            return False
+        tag_modulation = TYPE_TO_MODULATION.get(tag_item.type_name)
+        rx_modulation = TYPE_TO_MODULATION.get(rx_item.type_name)
+        if tag_modulation and tag_modulation != rx_modulation:
+            self._convert_node_modulation(rx_item, tag_modulation)
+            return True
+        return False
 
     def _edge_exists(self, from_node, from_port_name, to_node, to_port_name):
         return any(e.from_node is from_node and e.from_port_name == from_port_name
@@ -3362,6 +3979,17 @@ class CanvasWindow(QtWidgets.QMainWindow):
     def update_edges_for_node(self, node_item):
         for edge in self.edges:
             if edge.from_node is node_item or edge.to_node is node_item:
+                if edge.is_reader_shadow:
+                    # A reader's hidden return leg never measures its
+                    # own distance -- it mirrors the ONE visible channel
+                    # (the forward edge the user actually wired) a few
+                    # lines below instead, since "only one channel, same
+                    # physical path" is the whole point of a monostatic
+                    # reader. Still needs update_path() so its endpoints
+                    # stay correct for scene_to_topology()'s own distance
+                    # math, even though nothing ever draws it.
+                    edge.update_path()
+                    continue
                 edge.update_path()
                 if edge.role is not None:
                     edge.sync_distance_from_position()
@@ -3374,7 +4002,14 @@ class CanvasWindow(QtWidgets.QMainWindow):
                         # info_label(). edge.to_node is always the tag
                         # on a forward edge (see _edge_channel_role()).
                         self.inspector.refresh_energy_info(edge.to_node)
+                        if edge.reader_shadow is not None:
+                            edge.reader_shadow.channel_params.update(edge.channel_params)
         self._update_wake_ranges()
+        # No position-lock needed here any more: a combined reader is ONE
+        # visible node now (see add_reader()) -- its hidden rx half is
+        # never added to the scene, so nothing can ever drag it
+        # independently, and there's no second on-canvas position left
+        # to keep in sync with this one.
 
     def _update_wake_ranges(self):
         """Redraws every currently-visible wake-up-range ring (and the
@@ -3642,20 +4277,61 @@ class CanvasWindow(QtWidgets.QMainWindow):
             elif isinstance(item, EdgeItem):
                 self._delete_edge(item)
 
-    def _delete_node(self, node_item):
+    def _delete_node(self, node_item, _cascade_partner=True):
+        """_cascade_partner=False is used only by the recursive call
+        just below (deleting a reader's OTHER half) and by
+        _convert_node_modulation() (rebuilding one half of a reader in
+        place must never take its partner down too) -- every other
+        caller wants the normal cascading behavior. The leading guard
+        makes deleting BOTH halves of one reader in the same
+        delete_selected() pass safe: the first call's own cascade
+        already removed the second half from self.nodes by the time
+        delete_selected()'s loop reaches it directly."""
+        if self.nodes.get(node_item.node_id) is not node_item:
+            return
+        partner = node_item.reader_partner
         for edge in [e for e in self.edges if e.from_node is node_item or e.to_node is node_item]:
             self._delete_edge(edge)
         del self.nodes[node_item.node_id]
-        self.view.scene().removeItem(node_item)
+        # A reader's hidden rx half (see add_reader()/NodeItem.
+        # reader_partner) was deliberately never added to the scene --
+        # scene() is None for it, same reason _delete_edge() guards its
+        # own removeItem() call for a shadow return edge.
+        if node_item.scene() is not None:
+            self.view.scene().removeItem(node_item)
         if self.inspector.current_node is node_item:
             self.inspector.show_node(None)
         self._update_wake_ranges()
+        if _cascade_partner and partner is not None and partner.node_id in self.nodes:
+            self._delete_node(partner, _cascade_partner=False)
 
     def _delete_edge(self, edge_item):
+        if edge_item not in self.edges:
+            return
         self.edges.remove(edge_item)
-        self.view.scene().removeItem(edge_item)
+        # A reader's hidden shadow return edge (see
+        # _wire_reader_shadow_return()) was deliberately never added
+        # to the scene -- scene() is None for it, and QGraphicsScene.
+        # removeItem() on an item that was never added to this scene is
+        # exactly the thing to avoid calling.
+        if edge_item.scene() is not None:
+            self.view.scene().removeItem(edge_item)
         if self.inspector.current_edge is edge_item:
             self.inspector.show_node(None)
+        if edge_item.reader_shadow is not None:
+            # This was a reader's visible forward edge (sender->tag) --
+            # take its hidden return leg (tag->rx) down with it, and
+            # give the tag's output port back since it's no longer
+            # spoken for by this reader.
+            shadow = edge_item.reader_shadow
+            if shadow in self.edges:
+                self.edges.remove(shadow)
+            edge_item.reader_shadow = None
+            tag = edge_item.to_node
+            if tag.out_ports:
+                out_handle = tag.port_handles.get(("out", tag.out_ports[0].name))
+                if out_handle is not None:
+                    out_handle.set_auto_wired(False)
         self._update_wake_ranges()
 
     def copy_selected(self):
@@ -3678,6 +4354,22 @@ class CanvasWindow(QtWidgets.QMainWindow):
             self.status.showMessage("Select exactly one node to copy.", 4000)
             return
         node = selected_nodes[0]
+        if node.reader_partner is not None:
+            # Not supported yet -- a combined reader (see add_reader())
+            # is visibly one node, but it's still backed by two real
+            # NodeItems (the visible sender plus its never-scene-added
+            # hidden rx), and this clipboard only ever holds one node's
+            # data. Copying just the sender alone would paste a floating
+            # sender with no hidden rx behind it at all, silently
+            # dropping the "combined reader" behavior entirely --
+            # refusing is less confusing than that. (The hidden rx
+            # itself can never reach this method in the first place,
+            # since selectedItems() only ever contains items that were
+            # added to the scene.)
+            self.status.showMessage(
+                "Copy/paste isn't supported for a combined reader yet -- drag a fresh "
+                "'reader' from the palette instead.", 6000)
+            return
 
         fwd_edge = next((e for e in self.edges if e.role == "forward" and e.to_node is node), None)
         ret_edge = next((e for e in self.edges if e.role == "return" and e.from_node is node), None)
@@ -3903,17 +4595,69 @@ class CanvasWindow(QtWidgets.QMainWindow):
 
         pending_edges = []  # (role, this_node's_old_port, other_node, other_port)
         for e in self.edges:
+            if e.is_reader_shadow:
+                # Deliberately NOT queued for the generic recreate-via-
+                # add_edge() loop below -- that loop always calls the
+                # plain, public add_edge(), which unconditionally scene-
+                # adds whatever it creates. Recreating a shadow edge that
+                # way would make it pop into VISIBLE existence as a
+                # second, duplicate arrow the instant a reader's tag or
+                # rx switches modulation. Both actual cases are handled
+                # correctly without this entry: converting the TAG a
+                # shadow starts from also deletes (and, a few lines
+                # below, properly re-queues) the real forward edge
+                # feeding that tag, and recreating THAT forward edge
+                # re-fires add_edge()'s own reader hook, which re-derives
+                # a fresh, correctly-hidden shadow on its own. Converting
+                # the reader's RX itself doesn't touch the forward edge
+                # at all (neither endpoint is the rx), so that path is
+                # handled explicitly below instead, right after
+                # reader_partner is restored on the rebuilt replacement.
+                continue
             if e.from_node is node_item:
                 pending_edges.append(("out", e.from_port_name, e.to_node, e.to_port_name))
             elif e.to_node is node_item:
                 pending_edges.append(("in", e.to_port_name, e.from_node, e.from_port_name))
 
-        self._delete_node(node_item)
+        # reader_partner: None for a tag (tags are never a reader's own
+        # sender/rx half, see add_reader()) -- captured before the
+        # delete below so a combined reader's rx can switch modulation
+        # WITHOUT its sender half getting cascade-deleted along with it
+        # (_cascade_partner=False), and so the link can be restored onto
+        # the freshly rebuilt replacement node right after. Only a
+        # reader's hidden RX ever actually reaches this method with
+        # reader_partner set (TYPE_TO_MODULATION has no "sender" entry,
+        # so a sender itself never goes through a modulation switch) --
+        # which is also why add_to_scene below is keyed off it: the
+        # rebuilt replacement has to stay just as invisible as the node
+        # it's replacing, or a modulation switch would silently turn a
+        # reader back into V1's two-visible-boxes bug.
+        reader_partner = node_item.reader_partner
+        self._delete_node(node_item, _cascade_partner=False)
         new_item = self.add_node(new_type_name, center, node_id=node_id,
                                   params=new_params, payload=payload, decoder_params=decoder_params,
                                   payload_mode=payload_mode, message_text=message_text,
                                   chunk_bytes=chunk_bytes, file_bytes=file_bytes,
-                                  file_name=file_name, order_seq=order_seq)
+                                  file_name=file_name, order_seq=order_seq,
+                                  add_to_scene=reader_partner is None)
+        if reader_partner is not None:
+            new_item.reader_partner = reader_partner
+            reader_partner.reader_partner = new_item
+            # node_item here is always a reader's hidden rx (see this
+            # method's own reader_partner comment above) -- reader_
+            # partner is its sender, whose forward edge to a tag (if
+            # any) was never touched by the delete above, since neither
+            # of ITS endpoints is the rx being rebuilt. That forward
+            # edge's own OLD shadow WAS torn down though (every edge
+            # touching the old rx got deleted, see _delete_node()), and
+            # was deliberately skipped from pending_edges above rather
+            # than generically recreated -- re-derive it properly here
+            # instead, now that new_item (the rebuilt rx) actually
+            # exists to point it at.
+            fwd = next((e for e in self.edges
+                        if e.role == "forward" and e.from_node is reader_partner), None)
+            if fwd is not None:
+                self._wire_reader_shadow_return(fwd)
         if was_selected:
             new_item.setSelected(True)
 
@@ -4229,10 +4973,26 @@ class CanvasWindow(QtWidgets.QMainWindow):
         # unconditionally themselves; the canvas previously made you
         # draw it by hand, which is also what made it easy to mis-wire
         # (see NodeItem.PORT_SPACING's comment on the port-proximity fix).
+        #
+        # Re-scoped for combined readers (see add_reader()): a reader's
+        # own sender is a DEDICATED, co-located antenna for its own rx
+        # alone -- its Tx_Leakage_Out now wires ONLY to that one paired
+        # rx, never to any other receiver on the canvas, and its own rx
+        # never receives leakage from any OTHER sender either. Two
+        # separate monostatic readers are two physically distinct
+        # devices; they were never supposed to see each other's
+        # leakage. Every STANDALONE sender/receiver (reader_partner is
+        # None -- the only case that existed before readers did) keeps
+        # exactly the old all-pairs behavior among themselves.
         senders = [n for n in self.nodes.values() if n.type_name == "sender"]
         receivers = [n for n in self.nodes.values() if n.type_name.startswith("rx_")]
+        standalone_receivers = [n for n in receivers if n.reader_partner is None]
         for sender in senders:
-            for rx in receivers:
+            if sender.reader_partner is not None:
+                edges.append((sender.node_id, "Tx_Leakage_Out",
+                              sender.reader_partner.node_id, "Tx_Leakage_In"))
+                continue
+            for rx in standalone_receivers:
                 edges.append((sender.node_id, "Tx_Leakage_Out", rx.node_id, "Tx_Leakage_In"))
 
         # Auto-create and wire one packet_hex_decoder per receiver,
@@ -4327,6 +5087,15 @@ class CanvasWindow(QtWidgets.QMainWindow):
             if item.energy_per_bit is not None:
                 n["energy_per_bit"] = item.energy_per_bit
                 n["energy_static_rate"] = item.energy_static_rate
+            if item.reader_partner is not None:
+                # See add_reader()/NodeItem.reader_partner -- just the
+                # OTHER node's id. The hidden rx half's position is
+                # saved the same way as any other node's (pos() works
+                # fine on an item that was never added to the scene), but
+                # it's cosmetic bookkeeping only now -- nothing on screen
+                # ever reads it, since the rx half never draws and can't
+                # be dragged (see add_node()'s add_to_scene param).
+                n["reader_partner"] = item.reader_partner.node_id
             nodes.append(n)
         # Each edge saves as a plain [from, from_port, to, to_port] list,
         # same shape as before, UNLESS it actually carries a channel (see
@@ -4336,8 +5105,20 @@ class CanvasWindow(QtWidgets.QMainWindow):
         # silently resetting back to its seeded default. _load_layout_dict
         # below accepts both shapes, so an OLD saved layout (every edge
         # a plain list) still loads unchanged.
+        #
+        # A reader's hidden shadow return edge (EdgeItem.is_reader_
+        # shadow) is deliberately skipped here -- it's always fully
+        # reconstructible from the reader_partner link above plus
+        # whichever tag's forward edge is saved below, so saving it too
+        # would just recreate it a second time on the next Load (see
+        # add_edge()'s own _edge_exists() guard against that -- harmless
+        # for the real wiring, but it would also wrongly show up as a
+        # second, visible arrow, since loading it back via a plain
+        # add_edge() call has no way to know it was meant to stay hidden).
         edges = []
         for e in self.edges:
+            if e.is_reader_shadow:
+                continue
             if e.channel_params is not None:
                 edges.append({
                     "from": e.from_node.node_id, "from_port": e.from_port_name,
@@ -4358,6 +5139,15 @@ class CanvasWindow(QtWidgets.QMainWindow):
         self.inspector.show_node(None)
 
         for n in data.get("nodes", []):
+            # A reader's visible sender half uses its own "reader" icon
+            # (see ICON_DIR's comment/add_reader()) -- known straight
+            # from THIS node's own saved dict (its "reader_partner" key,
+            # written by _serialize_layout()), no need to wait for the
+            # link-restoration pass below. A plain sender has no
+            # "reader_partner" key at all and keeps icon_type_name=None,
+            # same as every other ordinary node.
+            icon_type_name = (
+                "reader" if n["type"] == "sender" and n.get("reader_partner") else None)
             self.add_node(
                 n["type"], QtCore.QPointF(n["x"], n["y"]), node_id=n["id"],
                 params=n.get("params"), payload=n.get("payload"),
@@ -4376,7 +5166,35 @@ class CanvasWindow(QtWidgets.QMainWindow):
                 order_seq=n.get("order_seq"),
                 energy_per_bit=n.get("energy_per_bit"),
                 energy_static_rate=n.get("energy_static_rate"),
+                icon_type_name=icon_type_name,
             )
+
+        # Restore combined-reader links (see add_reader()/NodeItem.
+        # reader_partner) now that every node above has its real, final
+        # position -- BEFORE the edges loop below, since add_edge()'s
+        # own reader handling (auto-creating a tag's hidden shadow
+        # return edge) only fires when a forward edge's from_node already
+        # has reader_partner set. Missing entirely on any layout saved
+        # before readers existed, same None-falls-through-harmlessly
+        # pattern as order_seq above.
+        for n in data.get("nodes", []):
+            partner_id = n.get("reader_partner")
+            if partner_id and n["id"] in self.nodes and partner_id in self.nodes:
+                a, b = self.nodes[n["id"]], self.nodes[partner_id]
+                a.reader_partner = b
+                b.reader_partner = a
+                # The loop above added every node via add_node()'s
+                # default add_to_scene=True, so the hidden rx half just
+                # got drawn same as any other node. Pull it back out now
+                # that we know which of the pair it is -- a reader's
+                # hidden rx is always type_name.startswith("rx_") (its
+                # visible sender partner never is), matching the
+                # add_to_scene=False add_reader() itself uses when
+                # creating one fresh.
+                for item in (a, b):
+                    if item.type_name.startswith("rx_") and item.scene() is not None:
+                        self.view.scene().removeItem(item)
+
         for entry in data.get("edges", []):
             if isinstance(entry, dict):
                 from_id, from_port = entry["from"], entry["from_port"]

@@ -11,6 +11,19 @@ type_name:
     rx_fm0.png
     rx_miller.png
 
+One exception: the combined "reader" block (sender + rx shown/wired as
+one monostatic unit -- see CanvasWindow.add_reader()) is, under the
+hood, an ordinary 'sender' NodeItem -- but it uses its OWN icon file,
+separate from a plain standalone sender's:
+
+    reader.png
+
+Drop a reader.png in here to give the combined-reader block a distinct
+look from a plain sender node. If reader.png is missing, a reader falls
+back to sender.png (or the plain colored rectangle, if that's missing
+too) -- same "nothing breaks if you don't add one" rule as every other
+icon here.
+
 Notes:
 - PNG, transparent background. The shape (circle, rounded square,
   whatever) must already be baked into the image via its own
