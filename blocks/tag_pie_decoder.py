@@ -22,7 +22,7 @@ import threading
 
 
 class tag_pie_decoder(gr.hier_block2):
-    def __init__(self, bit_rate=10e3, enable_mac=1, packet_bits=16, samp_rate=2e6, slot_id=0, tari=12.5, threshold=0.6):
+    def __init__(self, bit_rate=10e3, enable_mac=1, packet_bits=16, pie_bits='0,1,0,1', samp_rate=2e6, slot_id=0, tari=12.5, threshold=0.6):
         gr.hier_block2.__init__(
             self, "Tag PIE Decoder",
                 gr.io_signature(1, 1, gr.sizeof_gr_complex*1),
@@ -35,6 +35,7 @@ class tag_pie_decoder(gr.hier_block2):
         self.bit_rate = bit_rate
         self.enable_mac = enable_mac
         self.packet_bits = packet_bits
+        self.pie_bits = pie_bits
         self.samp_rate = samp_rate
         self.slot_id = slot_id
         self.tari = tari
@@ -44,7 +45,7 @@ class tag_pie_decoder(gr.hier_block2):
         # Blocks
         ##################################################
 
-        self.epy_block_0 = epy_block_0.tag_pie_decoder(samp_rate=samp_rate, bit_rate=bit_rate, packet_len_bits=packet_bits, tari_us=tari, threshold=threshold, enable_mac=enable_mac, slot_id=slot_id)
+        self.epy_block_0 = epy_block_0.tag_pie_decoder(samp_rate=samp_rate, bit_rate=bit_rate, packet_len_bits=packet_bits, tari_us=tari, threshold=threshold, enable_mac=enable_mac, slot_id=slot_id, target_cmd_bits=pie_bits)
 
 
         ##################################################
@@ -74,6 +75,13 @@ class tag_pie_decoder(gr.hier_block2):
     def set_packet_bits(self, packet_bits):
         self.packet_bits = packet_bits
         self.epy_block_0.packet_len_bits = self.packet_bits
+
+    def get_pie_bits(self):
+        return self.pie_bits
+
+    def set_pie_bits(self, pie_bits):
+        self.pie_bits = pie_bits
+        self.epy_block_0.target_cmd_bits = self.pie_bits
 
     def get_samp_rate(self):
         return self.samp_rate

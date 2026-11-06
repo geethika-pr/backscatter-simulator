@@ -77,9 +77,10 @@ NODE_TYPES = {
             Param("slot_id", 0, basic=True, label="Assigned Slot ID"),
             Param("packet_bits", 16000, basic=True, label="Number of Packet Bits"),
             Param("bit_rate", 10e3, basic=True, label="Bit Rate"),
-            Param("enable_gated", 1, basic=True, label="Gated Mode"),
+            Param("enable_gated", 1, basic=False, label="Gated Mode"),
 
             # --- advanced: physical/RF tuning, hidden by default ---
+            Param("pie_bits", "0,1,0,1", basic=False, label="Expected Command Bits"),
             Param("p_th", 0.001, basic=False, label="Harvesting Threshold"),
             Param("alpha", 0.01, basic=False, label="Alpha Factor"),
             Param("as_real", 0.05, basic=False, label="Structural Scattering (Real)"),
@@ -106,8 +107,9 @@ NODE_TYPES = {
             Param("slot_id", 0, basic=True, label="Assigned Slot ID"),
             Param("packet_bits", 16, basic=True, label="Number of Packet Bits"),
             Param("bit_rate", 10e3, basic=True, label="Bit Rate"),
-            Param("enable_gated", 1, basic=True, label="Gated Mode"),
+            Param("enable_gated", 1, basic=False, label="Gated Mode"),
 
+            Param("pie_bits", "0,1,0,1", basic=False, label="Expected Command Bits"),
             Param("p_th", 0.001, basic=False, label="Harvesting Threshold"),
             Param("alpha", 0.01, basic=False, label="Alpha Factor"),
             Param("as_real", 0.0, basic=False, label="Structural Scattering (Real)"),
@@ -133,8 +135,9 @@ NODE_TYPES = {
             Param("slot_id", 0, basic=True, label="Assigned Slot ID"),
             Param("packet_bits", 16, basic=True, label="Number of Packet Bits"),
             Param("bit_rate", 10e3, basic=True, label="Bit Rate"),
-            Param("enable_gated", 1, basic=True, label="Gated Mode"),
+            Param("enable_gated", 1, basic=False, label="Gated Mode"),
 
+            Param("pie_bits", "0,1,0,1", basic=False, label="Expected Command Bits"),
             Param("p_th", 0.001, basic=False, label="Harvesting Threshold"),
             Param("alpha", 0.01, basic=False, label="Alpha Factor"),
             Param("as_real", 0.05, basic=False, label="Structural Scattering (Real)"),
@@ -160,9 +163,10 @@ NODE_TYPES = {
             Param("slot_id", 0, basic=True, label="Assigned Slot ID"),
             Param("packet_bits", 16, basic=True, label="Number of Packet Bits"),
             Param("bit_rate", 10e3, basic=True, label="Bit Rate"),
-            Param("enable_gated", 1, basic=True, label="Gated Mode"),
+            Param("enable_gated", 1, basic=False, label="Gated Mode"),
             Param("m", 2, basic=True, label="Miller Order (M)"),   # changes the encoding scheme itself
 
+            Param("pie_bits", "0,1,0,1", basic=False, label="Expected Command Bits"),
             Param("mod_depth", 1.0, basic=False, label="Modulation Depth"),
             Param("p_th", 0.001, basic=False, label="Harvesting Threshold"),
             Param("alpha", 0.01, basic=False, label="Alpha Factor"),
@@ -189,7 +193,7 @@ NODE_TYPES = {
             Param("slot_id", 0, basic=True, label="Assigned Slot ID"),
             Param("packet_bits", 16, basic=True, label="Number of Packet Bits"),
             Param("bit_rate", 10e3, basic=True, label="Bit Rate"),
-            Param("enable_gated", 1, basic=True, label="Gated Mode"),
+            Param("enable_gated", 1, basic=False, label="Gated Mode"),
             Param("analog_mode", 0, basic=True, label="Analog Mode"),   # selects preset vs custom gamma below
 
             Param("mod_depth", 0.8, basic=False, label="Modulation Depth"),
@@ -410,8 +414,8 @@ NODE_TYPES = {
         ],
         params=[
             Param("tari", 12.5, basic=True, label="Tari (reader symbol time, µs)"),
-            Param("enable_gated", 0, basic=True, label="Gated Mode"),
             Param("tx_power_send", 20, basic=True, label="Tx Power"),
+            Param("enable_gated", 1, basic=False, label="Gated Mode"),
 
             Param("command_bits", (0, 1, 0, 1), basic=False, label="Reader Command Bits"),
             Param("carrier_freq_send", 0, basic=False, label="Carrier Frequency Offset"),
@@ -437,6 +441,7 @@ NODE_TYPES = {
             Param("bit_rate", 10e3, basic=True, label="Bit Rate"),
             Param("tari", 12.5, basic=True, label="Tari (reader symbol time, µs)"),
 
+            Param("pie_bits", "0,1,0,1", basic=False, label="Expected Command Bits"),
             Param("threshold", 0.6, basic=False, label="Slicer Threshold"),
             Param("enable_mac", 1, basic=False, label="Enable MAC"),
             Param("samp_rate", 2e6, basic=False, label="Sample Rate"),

@@ -26,20 +26,24 @@ class packet_hex_decoder(gr.sync_block):
     def work(self, input_items, output_items):
         in_bits = input_items[0]
         n_samples = len(in_bits)
+        sps = self.sps
 
-        for i in range(n_samples):
-            self.sample_subcount += 1
-            if self.sample_subcount < self.sps:
-                continue
-            self.sample_subcount = 0
+        # Jump straight to the next symbol-aligned sample instead of
+        # looping + continue-skipping every raw sample in between.
+        first_idx = (sps - 1 - self.sample_subcount) % sps
+        if first_idx >= n_samples:
+            self.sample_subcount += n_samples
+            return n_samples
 
+        last_idx = first_idx
+        for i in range(first_idx, n_samples, sps):
+            last_idx = i
             bit = 1 if in_bits[i] > 0 else 0
 
             if self.state == "SEARCHING":
                 self.shift_reg.append(bit)
                 if len(self.shift_reg) > len(self.preamble):
                     self.shift_reg.pop(0)
-
                 if self.shift_reg == self.preamble:
                     self.state = "COLLECTING"
                     self.collected_bits = []
@@ -52,6 +56,7 @@ class packet_hex_decoder(gr.sync_block):
                     self.state = "SEARCHING"
                     self.collected_bits = []
 
+        self.sample_subcount = n_samples - 1 - last_idx
         return n_samples
 
     def _dispatch_packet(self, bits):

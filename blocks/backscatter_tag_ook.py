@@ -61,7 +61,7 @@ import threading
 
 
 class backscatter_tag_ook(gr.hier_block2):
-    def __init__(self, alpha=0.01, as_imag=0.0, as_real=0.05, bit_rate=10e3, enable_gated=1, gamma0_mag=0.1, gamma0_phase_deg=180.0, gamma1_mag=0.9, gamma1_phase_deg=180.0, p_th=0.001, packet_bits=16000, samp_rate=2e6, slot_id=0):
+    def __init__(self, alpha=0.01, as_imag=0.0, as_real=0.05, bit_rate=10e3, enable_gated=1, gamma0_mag=0.1, gamma0_phase_deg=180.0, gamma1_mag=0.9, gamma1_phase_deg=180.0, p_th=0.001, packet_bits=16000, pie_bits='0,1,0,1', samp_rate=2e6, slot_id=0):
         gr.hier_block2.__init__(
             self, "Tag OOK (Backscatter)",
                 gr.io_signature.makev(2, 2, [gr.sizeof_gr_complex*1, gr.sizeof_char*1]),
@@ -82,6 +82,7 @@ class backscatter_tag_ook(gr.hier_block2):
         self.gamma1_phase_deg = gamma1_phase_deg
         self.p_th = p_th
         self.packet_bits = packet_bits
+        self.pie_bits = pie_bits
         self.samp_rate = samp_rate
         self.slot_id = slot_id
 
@@ -93,6 +94,7 @@ class backscatter_tag_ook(gr.hier_block2):
             bit_rate=10e3,
             enable_mac=enable_gated,
             packet_bits=packet_bits,
+            pie_bits=pie_bits,
             samp_rate=samp_rate,
             slot_id=slot_id,
             tari=12.5,
@@ -208,6 +210,13 @@ class backscatter_tag_ook(gr.hier_block2):
     def set_packet_bits(self, packet_bits):
         self.packet_bits = packet_bits
         self.tag_pie_decoder_1.set_packet_bits(self.packet_bits)
+
+    def get_pie_bits(self):
+        return self.pie_bits
+
+    def set_pie_bits(self, pie_bits):
+        self.pie_bits = pie_bits
+        self.tag_pie_decoder_1.set_pie_bits(self.pie_bits)
 
     def get_samp_rate(self):
         return self.samp_rate

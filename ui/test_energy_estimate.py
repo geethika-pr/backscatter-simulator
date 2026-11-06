@@ -41,6 +41,18 @@ What this checks, and why each one matters:
      1-4 above: no NodeItem/QGraphicsScene needed) -- total_frame_bits()
      itself is just len(build_fragments(...)) * fragment_len_bits(...),
      so reproducing that arithmetic here is reproducing the real method.
+  6. _switch_energy_per_bit_joules() -- the FET/CMOS vs. BJT switch-
+     device formulas added for the "which switch technology" energy
+     model (see claude/energy-consumption-estimate.md's 2026-10-25
+     revision). Checks the two formulas' real-physics SHAPE
+     difference, not just their numbers: FET mode must be bit-rate-
+     independent and scale with Vdd^2 (the standard C*V^2 dynamic-
+     power result); BJT mode must be bit-rate- AND duty-cycle-
+     dependent (the real bipolar-transistor resistive-bias hardware
+     this cites, per the Kimionis reference thesis's own measured
+     circuit) -- these two are not the same shape with different
+     constants plugged in, and this check would fail if a future edit
+     accidentally made them so.
 
 Run from the project root, venv active:
     python3 ui/test_energy_estimate.py
@@ -50,7 +62,9 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-from ui.canvas_window import _harvested_power, _wake_up_radius_m  # noqa: E402
+from ui.canvas_window import (  # noqa: E402
+    _harvested_power, _wake_up_radius_m, _switch_energy_per_bit_joules,
+)
 from core import message_framer  # noqa: E402
 
 TX_POWER = 20.0
@@ -123,6 +137,39 @@ def main():
     old_buggy_value = message_framer.fragment_len_bits(chunk_bytes)
     print(f"OK: 'Hello' -> {hello_bits} bits, 'Geethika' -> {geethika_bits} bits "
           f"(no longer both {old_buggy_value})")
+
+    # FET mode: flat, bit-value-symmetric, bit-rate-independent
+    # E_bit = C_gate * Vdd^2.
+    e_fet = _switch_energy_per_bit_joules("fet", 3.0, c_gate_f=15e-15)
+    assert abs(e_fet - (15e-15 * 3.0 ** 2)) < 1e-20, e_fet
+    e_fet_other_rate = _switch_energy_per_bit_joules("fet", 3.0, c_gate_f=15e-15, bit_rate=1e3)
+    assert e_fet_other_rate == e_fet, "FET mode must be bit-rate-independent"
+    e_fet_6v = _switch_energy_per_bit_joules("fet", 6.0, c_gate_f=15e-15)
+    assert abs(e_fet_6v - e_fet * 4) < 1e-20, "FET mode must scale with Vdd^2"
+    print(f"OK: FET mode (15fF, 3V) -> {e_fet:.3e} J/bit, bit-rate-independent, scales as Vdd^2")
+
+    # BJT mode: duty-cycle- and bit-rate-dependent
+    # E_bit = duty_cycle * (Vdd^2 / R_bias) * (1 / bit_rate).
+    e_bjt = _switch_energy_per_bit_joules("bjt", 3.0, r_bias_ohm=2000.0,
+                                           duty_cycle=0.5, bit_rate=10e3)
+    expected_bjt = 0.5 * (3.0 ** 2 / 2000.0) * (1.0 / 10e3)
+    assert abs(e_bjt - expected_bjt) < 1e-15, e_bjt
+    e_bjt_half_rate = _switch_energy_per_bit_joules("bjt", 3.0, r_bias_ohm=2000.0,
+                                                      duty_cycle=0.5, bit_rate=5e3)
+    assert abs(e_bjt_half_rate - e_bjt * 2) < 1e-15, "BJT mode must be bit-rate-dependent"
+    e_bjt_full_duty = _switch_energy_per_bit_joules("bjt", 3.0, r_bias_ohm=2000.0,
+                                                      duty_cycle=1.0, bit_rate=10e3)
+    assert abs(e_bjt_full_duty - e_bjt * 2) < 1e-15, "BJT mode must scale linearly with duty_cycle"
+    print(f"OK: BJT mode (2kOhm, 3V, duty=0.5, 10kbit/s) -> {e_bjt:.3e} J/bit, "
+          f"bit-rate- and duty-cycle-dependent")
+
+    # Missing/invalid params -> None, never a silent 0 or a crash.
+    assert _switch_energy_per_bit_joules("fet", 3.0, c_gate_f=None) is None
+    assert _switch_energy_per_bit_joules("bjt", 3.0, r_bias_ohm=None,
+                                          duty_cycle=0.5, bit_rate=1e3) is None
+    assert _switch_energy_per_bit_joules("bjt", 3.0, r_bias_ohm=2000.0,
+                                          duty_cycle=0.5, bit_rate=0) is None
+    print("OK: missing/invalid switch-model params return None, not a crash or a silent 0")
 
     print("\nAll energy-estimate checks passed.")
 

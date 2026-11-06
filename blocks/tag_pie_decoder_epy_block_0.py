@@ -14,7 +14,8 @@ class tag_pie_decoder(gr.sync_block):
     STATE_BURST = 2
 
     def __init__(self, samp_rate=2e6, bit_rate=40e3, packet_len_bits=16,
-                 tari_us=12.5, threshold=0.5, enable_mac=True, slot_id=0):
+                 tari_us=12.5, threshold=0.5, enable_mac=True, slot_id=0,
+                 target_cmd_bits="0101"):
         gr.sync_block.__init__(
             self,
             name="Tag PIE Decoder & Gate",
@@ -35,11 +36,26 @@ class tag_pie_decoder(gr.sync_block):
         self.high_count = 0
         self.in_notch = False
         self.decoded_bits = []
-        self.target_cmd = [0, 1, 0, 1]
+        self.target_cmd_bits = str(target_cmd_bits)
+        self.target_cmd = self._parse_cmd_bits(self.target_cmd_bits)
 
         # Explicit state machine
         self.state = self.STATE_IDLE
         self.counter = 0
+
+    def _parse_cmd_bits(self, bits_str):
+        # Turn a string like "0101" into the same [0, 1, 0, 1]-style list
+        # the match logic below compares self.decoded_bits against. Any
+        # character that isn't '0' or '1' (spaces, commas, etc.) is just
+        # skipped, so "0, 1, 0, 1" or "0 1 0 1" also work.
+        parsed = [1 if ch == '1' else 0 for ch in str(bits_str) if ch in ('0', '1')]
+        if not parsed:
+            # Empty/garbage input would make `decoded_bits == target_cmd`
+            # trivially true the moment decoded_bits is also empty --
+            # fall back to the original default instead of matching on
+            # nothing.
+            return [0, 1, 0, 1]
+        return parsed
 
     def _recalculate_timing(self):
 
@@ -74,6 +90,16 @@ class tag_pie_decoder(gr.sync_block):
         self.packet_len_bits = int(packet_len_bits)
         self._recalculate_timing()
 
+    def set_target_cmd_bits(self, target_cmd_bits):
+        self.target_cmd_bits = str(target_cmd_bits)
+        self.target_cmd = self._parse_cmd_bits(self.target_cmd_bits)
+        # A mid-run length/content change could leave a stale
+        # decoded_bits window comparing against the new target at the
+        # wrong length -- reset it so the next match is clean.
+        self.decoded_bits = []
+        self.high_count = 0
+        self.in_notch = False
+
     def work(self, input_items, output_items):
         rf_in = input_items[0]
         gate_out = output_items[0]
@@ -84,43 +110,49 @@ class tag_pie_decoder(gr.sync_block):
             return n_samples
 
         mag = np.abs(rf_in)
-
-        for i in range(n_samples):
-            # -------------------------------------------------------------
-            # STATE 2: BURST TRANSMISSION
-            # -------------------------------------------------------------
+        i = 0
+        while i < n_samples:
+            # STATE 2: BURST -- counter decrement is data-independent,
+            # so skip straight to where it would hit zero.
             if self.state == self.STATE_BURST:
-                gate_out[i] = 1.0
-                self.counter -= 1
-                if self.counter <= 0:
-                    # Packet burst finished -> return to listening
+                n_needed = self.counter if self.counter >= 1 else 1
+                remaining = n_samples - i
+                if n_needed > remaining:
+                    gate_out[i:n_samples] = 1.0
+                    self.counter -= remaining
+                    i = n_samples
+                else:
+                    gate_out[i:i + n_needed] = 1.0
+                    self.counter -= n_needed
                     self.state = self.STATE_IDLE
                     self.decoded_bits = []
                     self.high_count = 0
                     self.in_notch = False
                     print(f">>> [Tag Slot {self.slot_id}]: Burst finished. Sleeping.", flush=True)
+                    i += n_needed
 
-            # -------------------------------------------------------------
-            # STATE 1: SLOT DELAY COUNTDOWN
-            # -------------------------------------------------------------
+            # STATE 1: SLOT DELAY COUNTDOWN -- same reasoning.
             elif self.state == self.STATE_DELAY:
-                gate_out[i] = 0.0
-                self.counter -= 1
-                if self.counter <= 0:
-                    # Delay over -> trigger transmission
+                n_needed = self.counter if self.counter >= 1 else 1
+                remaining = n_samples - i
+                if n_needed > remaining:
+                    gate_out[i:n_samples] = 0.0
+                    self.counter -= remaining
+                    i = n_samples
+                else:
+                    if n_needed > 1:
+                        gate_out[i:i + n_needed - 1] = 0.0
                     self.state = self.STATE_BURST
                     self.counter = self.burst_window_samples
-                    gate_out[i] = 1.0
+                    gate_out[i + n_needed - 1] = 1.0
                     print(f">>> [Tag Slot {self.slot_id}]: Slot delay elapsed! Firing burst.", flush=True)
+                    i += n_needed
 
-            # -------------------------------------------------------------
-            # STATE 0: IDLE (DECODING READER COMMAND)
-            # -------------------------------------------------------------
+            # STATE 0: IDLE -- genuinely per-sample, has to inspect mag[i].
             else:
                 gate_out[i] = 0.0
                 sample_mag = mag[i]
 
-                # Notch low detection
                 if sample_mag < self.threshold:
                     if not self.in_notch:
                         if self.high_count >= 6:
@@ -130,25 +162,21 @@ class tag_pie_decoder(gr.sync_block):
                         self.in_notch = True
                         self.high_count = 0
                 else:
-                    # Carrier high
                     if self.in_notch:
                         self.in_notch = False
                         self.high_count = 1
                     else:
                         self.high_count += 1
-                        # Capture trailing bit when carrier returns to continuous CW
                         if len(self.decoded_bits) == 3 and self.high_count > int(self.decision_boundary * 1.5):
                             self.decoded_bits.append(1)
                             print(f"[Tag Slot {self.slot_id}]: Saw bit 1 (trailing CW)", flush=True)
                             self.high_count = 1000
 
-                # Keep window bounded to target length
                 if len(self.decoded_bits) > len(self.target_cmd):
                     self.decoded_bits.pop(0)
 
-                # Command Match Check
                 if self.decoded_bits == self.target_cmd:
-                    print(f">>> [Tag Slot {self.slot_id}]: MATCH [0, 1, 0, 1]! Scheduling slot...", flush=True)
+                    print(f">>> [Tag Slot {self.slot_id}]: MATCH {self.target_cmd}! Scheduling slot...", flush=True)
                     self.decoded_bits = []
                     self.high_count = 0
                     self.in_notch = False
@@ -161,5 +189,6 @@ class tag_pie_decoder(gr.sync_block):
                         self.state = self.STATE_BURST
                         self.counter = self.burst_window_samples
                         gate_out[i] = 1.0
+                i += 1
 
         return n_samples

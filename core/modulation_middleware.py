@@ -1,73 +1,24 @@
 """
-Generalized version of MultiTagOokMiddleware -- builds the same proven
+Registry-driven version of MultiTagOokMiddleware: builds the same
 topology (throttle -> fwd channel -> fan-out to tags -> fan-in adder ->
-ret channel -> rx -> decoder) but picks which tag/rx classes to use from
-registry.MODULATION_MAP + registry.NODE_TYPES, instead of hardcoding
-OOK's imports the way multi_tag_middleware.py does. This is what makes
-"pick a modulation from a dropdown" possible without writing a new
-middleware class per modulation.
+ret channel -> rx -> decoder) but picks tag/rx classes from
+registry.MODULATION_MAP/NODE_TYPES instead of hardcoding OOK's imports.
+This is what makes the modulation dropdown possible. Additive --
+multi_tag_middleware.py/MultiTagOokMiddleware is untouched.
 
-This file is additive -- multi_tag_middleware.py / MultiTagOokMiddleware
-is untouched and still what ui/main_window.py runs. Nothing here changes
-that proven path.
-
-IMPORTANT -- what this does and doesn't prove:
-  This proves the registry-driven construction mechanism works: the
-  right classes get imported, the right ports get wired, the right
-  default params get applied, and any param name shared between a tag
-  and its rx (bit_rate, m, samp_rate) gets synced automatically instead
-  of silently drifting apart the way OOK's did earlier in this project.
-
-  packet_bits and p_th are applied as DEFAULT_TAG_OVERRIDES for every
-  modulation, not just OOK -- burst duration (packet_bits controls how
-  long tag_pie_decoder holds its gate open) and the harvesting
-  threshold are properties of tag_pie_decoder/harvesting_gate, which
-  are the same shared sub-blocks nested inside every tag_* hier-block
-  regardless of modulation. Leaving them at the registry's un-tuned
-  defaults (packet_bits=16 for everything but OOK) produced a burst
-  too short for the receiver chain to ever catch -- confirmed by
-  testing: Miller captured nothing, BPSK caught a sliver and decoded
-  garbage. Neither is a modulation-specific problem, so the fix isn't
-  either.
-
-  BPSK's earlier wrong-bit decode was NOT a phase-ambiguity problem --
-  once the packet_bits/p_th fix above landed, BPSK decoded correctly.
-  It was the same too-short-burst issue as everyone else, nothing
-  BPSK-specific.
-
-  FM0 and Miller needed one more fix, confirmed by reading
-  backscatter_rx_fm0.py/backscatter_rx_miller.py and their embedded
-  epy_blocks directly: both rx_fm0 and rx_miller already decimate
-  their own output down to one sample per bit internally (their epy
-  decoder is a gr.decim_block with decim=samp_rate/bit_rate) --
-  unlike rx_ook/rx_bpsk, whose Data_Out is still at full sample rate.
-  packet_hex_decoder was being built with samp_rate=SAMP_RATE
-  unconditionally, so for FM0/Miller it was decimating an
-  already-decimated, already-one-sample-per-bit stream a second time
-  -- effectively sampling noise, which matches exactly what was seen
-  (Miller: zero packets; occasional garbage). See
-  RX_ALREADY_AT_BIT_RATE below for the fix: for those two rx types,
-  packet_hex_decoder is now built with samp_rate=bit_rate (sps=1, no
-  further decimation) instead of samp_rate=SAMP_RATE.
-
-  What's still genuinely unverified per-modulation, now that every
-  modulation's burst reaches the decoder at the rate it expects, is
-  bit-level DEMODULATION correctness -- whether rx_bpsk/rx_fm0/rx_miller
-  recover the right bits, not just that packets arrive at all. That's
-  a separate question from the plumbing fix here.
-
-  Analog is not supported yet -- its tag block takes a continuous
-  Signal_In (float), not the Data_In (byte) bitstream every other
-  modulation uses, so it needs a different payload-source block this
-  middleware doesn't build yet. Selecting it raises NotImplementedError
-  rather than silently building something wrong.
-
-Known, deliberately-not-fixed-yet issues that apply here same as in
-multi_tag_middleware.py: the self-interference sign bug present in
-every rx_* block (leaked Tx carrier gets added back in instead of
-cancelled), and every tag type's internal PIE-decoder timing being
-pinned to a hardcoded bit_rate=10e3 regardless of what bit_rate you
-pass in. Neither is new to this file, both are already tracked.
+Gotchas carried over from debugging each modulation:
+- packet_bits/p_th (DEFAULT_TAG_OVERRIDES) must be raised for ALL
+  modulations, not just OOK -- the registry's un-tuned defaults give a
+  burst too short for any receiver to catch.
+- FM0/Miller's rx already decimates to one sample/bit internally; see
+  RX_ALREADY_AT_BIT_RATE -- building their decoder at full SAMP_RATE
+  double-decimates and yields garbage/nothing.
+- Analog tag type is unsupported (continuous Signal_In, not a bitstream)
+  -- raises NotImplementedError rather than building something wrong.
+- SI sign bug in rx_* blocks: fixed directly in the Tier-1 blocks
+  (2026-10-22), not here.
+- Known, not-yet-fixed: every tag's internal PIE-decoder timing pinned
+  to bit_rate=10e3.
 """
 import sys
 import os
@@ -91,42 +42,25 @@ SAMP_RATE = 2e6
 PREAMBLE = "10101011"
 PREAMBLE_BITS = [int(b) for b in PREAMBLE]
 
-# Burst-timing overrides, applied to every modulation (see module
-# docstring for why this isn't OOK-specific): tag_pie_decoder and
-# harvesting_gate are the same shared sub-blocks inside every tag_*
-# hier-block, so a burst long enough to be reliably caught, and a
-# sane harvesting threshold, are universal requirements, not physics
-# tuning specific to OOK's demodulation scheme. Values validated
-# against OOK in test_matching_working_canvas.py; not yet validated
-# for the others, but definitely better than the un-tuned registry
-# default of packet_bits=16 (a 1.6ms burst -- too short to work at all).
+# Burst-timing overrides, applied to every modulation -- tag_pie_decoder/
+# harvesting_gate are shared sub-blocks inside every tag_* hier-block, so
+# these aren't OOK-specific tuning. Validated against OOK; better than the
+# registry default (packet_bits=16, too short to ever be caught).
 DEFAULT_TAG_OVERRIDES = {
     "packet_bits": 10000,
     "p_th": 0.5,
 }
 
-# si_isolation_db needs a genuinely different value per modulation's
-# DETECTOR TYPE, not a tuning nicety -- see BackscatterMiddleware's class
-# docstring for the full validated finding (OOK's envelope/magnitude
-# detector has ~zero tolerance for leftover SI-cancellation residual:
-# 1-25dB all identically broken, 100dB works; the phase-based schemes
-# absorb the same residual fine at ~25dB because their linear detection +
-# DC blocker combo removes any constant residual exactly). This lives
-# here, not only in ui/main_window.py, so that build_fixed_topology()
-# itself picks the right default for whatever modulation you asked for --
-# someone testing OOK right after Miller doesn't have to already know OOK
-# needs ~100dB to get a working default; ui/main_window.py imports this
-# same dict instead of keeping its own copy, so the two can't drift.
+# si_isolation_db is tuned per-modulation DETECTOR TYPE: OOK's envelope
+# detector needs ~100dB (1-25dB all broken); phase-based schemes (BPSK/
+# FM0/Miller) are fine at ~25dB since their DC blocker removes constant
+# residual exactly. ui/main_window.py imports this same dict so the two
+# can't drift apart.
 SI_ISOLATION_DEFAULTS = {"OOK": 100.0, "BPSK": 25.0, "FM0": 25.0, "Miller": 25.0}
 
-# rx_fm0 and rx_miller's embedded decoder (a gr.decim_block) already
-# decimates its Data_Out down to one sample per bit -- unlike
-# rx_ook/rx_bpsk, whose Data_Out is still at full sample rate. Building
-# packet_hex_decoder with samp_rate=SAMP_RATE for these two makes it
-# redundantly decimate an already-one-sample-per-bit stream a second
-# time (sps = SAMP_RATE/bit_rate instead of 1), which is why FM0/Miller
-# captured nothing/garbage even once the burst was long enough. See
-# module docstring for the full diagnosis.
+# rx_fm0/rx_miller already decimate Data_Out to one sample/bit internally,
+# unlike rx_ook/rx_bpsk (full sample rate). Building their decoder at
+# samp_rate=SAMP_RATE double-decimates -> garbage/nothing captured.
 RX_ALREADY_AT_BIT_RATE = {"rx_fm0", "rx_miller"}
 
 
@@ -135,15 +69,10 @@ def _registry_defaults(type_name):
 
 
 def _build_node(type_name, overrides, runtime_overrides=None):
-    """Look up a NODE_TYPES entry, import its class, instantiate it
-    with registry defaults + any overrides.
-
-    runtime_overrides is for the NodeType.runtime_params case (currently
-    just packet_hex_decoder's packet_queue): a constructor kwarg that
-    isn't a registry Param at all, so it's layered on last, after the
-    registry-defaults+overrides merge below, and a caller that doesn't
-    pass it (every existing BackscatterMiddleware call site) sees no
-    change in behavior.
+    """Look up a NODE_TYPES entry, import its class, instantiate with
+    registry defaults + overrides. runtime_overrides is for non-Param
+    constructor kwargs (e.g. packet_hex_decoder's packet_queue); applied
+    last, after the defaults+overrides merge.
     """
     nt = registry.NODE_TYPES[type_name]
     mod = importlib.import_module(nt.class_module)
@@ -157,13 +86,9 @@ def _build_node(type_name, overrides, runtime_overrides=None):
 
 def _port_index(type_name, port_name, direction):
     """Resolve a port NAME to its positional index within that direction.
-
-    Port names are cosmetic/for-display only (see registry.py's module
-    note on tag_fm0/tag_miller's "Reflection_Out" vs tag_ook/tag_bpsk's
-    plain "out") -- actual gnuradio wiring is always positional, via
-    self.connect((block, port_index), ...). This is what lets a topology
-    spec refer to "Carrier_In" instead of hardcoding a port number that
-    means nothing to a human reading the spec.
+    Port names are cosmetic only -- gnuradio wiring is always positional
+    (self.connect((block, port_index), ...)); this lets topology specs
+    use names instead of raw indices.
     """
     matches = [p for p in registry.NODE_TYPES[type_name].ports if p.direction == direction]
     for idx, p in enumerate(matches):
@@ -176,60 +101,36 @@ def _port_index(type_name, port_name, direction):
 
 
 def plan_topology(nodes, edges):
-    """Pure bookkeeping, no gnuradio objects touched -- resolves a
-    {"nodes": [...], "edges": [...]} topology spec (see TopologyMiddleware's
-    docstring for the exact format) into an ordered connection plan, so the
-    "what connects to what" logic can be written and tested once, and
-    sanity-checked on its own (see Test/test_topology_plan.py) independently
-    of whether gnuradio/the real blocks are even importable.
+    """Pure bookkeeping (no gnuradio objects touched): resolves a
+    {"nodes", "edges"} topology spec into an ordered connection plan.
+    Testable standalone (Test/test_topology_plan.py) without gnuradio.
 
     Returns a dict:
       "node_types": {node_id: type_name}
-      "connects": list of ((from_id, from_role, from_idx), to_ref) in the
-                  order they should be wired. from_role is "throttled" only
-                  for a sender node's port 0 (Carrier_Out) -- see
-                  TopologyMiddleware's docstring for why port 1 isn't.
-                  to_ref is (to_id, to_idx) for a plain 1-to-1 connection,
-                  or (to_id, "fanin", to_idx, group_size) when more than
-                  one edge targets that same (node, port) -- the caller
-                  builds one adder per such group instead of connecting
-                  straight through.
+      "connects": [((from_id, from_role, from_idx), to_ref), ...] in wire
+                  order. from_role is "throttled" only for a sender's
+                  port 0 (Carrier_Out) -- port 1 (leakage ref) is not
+                  throttled. to_ref is (to_id, to_idx), or
+                  (to_id, "fanin", to_idx, group_size) when several edges
+                  target the same (node, port) -- caller builds one adder
+                  per group.
       "needs_throttle": set of sender node ids.
-      "needs_zero_source": set of (channel node id, Interference_In index)
-                            pairs whose Interference_In no edge targets.
+      "needs_zero_source": (channel id, Interference_In idx) pairs with
+                  no edge wired to them.
       "fanin_groups": {(to_id, to_idx): [(from_id, from_idx), ...]}
-      "tag_frame_bits": {tag_node_id: list[0/1]} -- the EXACT bits that
-                  tag's vector_source_b should loop forever: its own
-                  "payload" (or, for a "payload_fragments" tag -- see
-                  message_framer.py -- every fragment with the preamble
-                  prepended to EACH one, all concatenated) with the
-                  right preamble prepended. Missing for a tag_* node
-                  that has neither "payload" nor "payload_fragments"
-                  (TopologyMiddleware raises its own clear error for
-                  that) or for tag_analog (different payload shape
-                  entirely, raised elsewhere).
-      "framed_decoders": set of packet_hex_decoder node ids with at
-                  least one upstream tag transmitting message_framer-
-                  framed fragments (not just raw hand-typed bits) --
-                  see get_packets()'s own docstring for why only these
-                  decoders attempt message reassembly.
+      "tag_frame_bits": {tag_id: list[0/1]} -- exact bits for that tag's
+                  vector_source_b (payload, or every payload_fragments
+                  fragment concatenated, each with its preamble). The
+                  preamble is resolved PER TAG by walking forward through
+                  any channel hops to the first receiver's decoder and
+                  reading ITS "preamble" param, not a single hardcoded
+                  value -- falls back to PREAMBLE_BITS if no decoder is
+                  reachable yet (mid-edit canvas).
+      "framed_decoders": packet_hex_decoder ids with >=1 upstream tag
+                  transmitting message_framer-framed fragments -- only
+                  these attempt message reassembly (see get_packets()).
 
-    The "right preamble" above is resolved PER TAG by walking the real
-    signal graph forward from the tag (through however many "channel"
-    hops) until a receiver with its own auto-wired decoder is reached,
-    and reading THAT decoder's own "preamble" param -- not a single
-    hardcoded value applied to every tag regardless of what any
-    receiver's own "Preamble" field says (which is what this used to
-    do, as a module-level PREAMBLE_BITS constant baked in at the
-    TopologyMiddleware.__init__ call site -- see NodeInspector.
-    show_node()'s now-removed tooltip on that field for the bug this
-    fixes). A tag with no path to any decoder (mid-edit on the canvas,
-    or a hand-built topology that doesn't bother wiring one) falls back
-    to PREAMBLE_BITS -- not an error, just nothing real to resolve.
-
-    Raises KeyError via _port_index if a spec names a port that node type
-    doesn't have -- fails loudly instead of building something silently
-    wrong.
+    Raises KeyError via _port_index on an unknown port name.
     """
     node_types = {n["id"]: n["type"] for n in nodes}
 
@@ -336,41 +237,24 @@ def plan_topology(nodes, edges):
 
 class BackscatterMiddleware:
     """
-    modulation: one of registry.MODULATION_MAP's keys -- "OOK", "BPSK",
-    "FM0", "Miller" (not yet "Analog", see module docstring).
+    modulation: a registry.MODULATION_MAP key -- "OOK"/"BPSK"/"FM0"/
+        "Miller" (not "Analog" yet).
 
-    tag_specs: list of dicts, e.g.
-        [{"slot_id": 0, "payload": [1,0,1,1,0]},
-         {"slot_id": 1, "payload": [1,1,0,0,1]}]
-    Every tag's payload must be the same length -- they share one
-    decoder that reads a fixed bit count after each preamble match.
-    That length is read from tag_specs itself (not a hardcoded
-    constant), so this isn't OOK-only the way multi_tag_middleware.py's
-    PAYLOAD_LEN_BITS=5 is.
+    tag_specs: [{"slot_id": int, "payload": [0/1,...]}, ...]. Every
+        tag's payload must be the same length (shared decoder reads a
+        fixed bit count per preamble match); length is read from the
+        specs, not hardcoded.
 
-    `distance` moves the RETURN channel only, live, same mechanism as
-    MultiTagOokMiddleware -- the forward channel is fixed at the
-    validated distance=1/noise=0.02 regardless of modulation.
+    distance: moves the RETURN channel only, live. Forward channel is
+        fixed at distance=1/noise=0.02.
 
-    `si_isolation_db` needs a very different value depending on
-    modulation, not just a tuning nicety: OOK's envelope/magnitude
-    detector has essentially zero tolerance for leftover SI-cancellation
-    residual (verified: 1-25dB all identically broken, 100dB works),
-    while the phase-based schemes (BPSK/FM0/Miller) absorb the same
-    residual cleanly at ~25dB because their linear detection + DC
-    blocker combo removes any constant residual exactly regardless of
-    its size. Pick the value per-modulation; there's no single default
-    that's right for both detector types. The self-interference sign
-    bug mentioned in the module docstring below is fixed in the current
-    rx_* blocks (confirmed against backscatter_rx_ook.py/
-    backscatter_rx_bpsk.py) -- what's left is this detector-type
-    sensitivity difference, not a code bug.
+    si_isolation_db: detector-type dependent, not a tuning nicety --
+        OOK needs ~100dB, phase-based schemes (BPSK/FM0/Miller) are fine
+        at ~25dB. No single default works for both.
 
-    `extra_tag_overrides`: optional dict merged on top of
-    DEFAULT_TAG_OVERRIDES for every tag, e.g. {"m": 4} to run Miller at
-    a non-default order. Anything here whose name also exists on the rx
-    type (m, bit_rate, samp_rate) gets synced to the rx automatically,
-    same as the existing tag_kwargs->rx_overrides mechanism below.
+    extra_tag_overrides: merged onto DEFAULT_TAG_OVERRIDES for every tag
+        (e.g. {"m": 4}). Any name shared with the rx type (m, bit_rate,
+        samp_rate) auto-syncs to the rx.
     """
 
     def __init__(self, modulation, tag_specs, distance=1, si_isolation_db=100.0,
@@ -466,12 +350,9 @@ class BackscatterMiddleware:
         self.tb.connect((sender, 1), (rx, 1))
         self._blocks.append(rx)
 
-        # FM0/Miller's rx already hands us one sample per bit (see
-        # RX_ALREADY_AT_BIT_RATE above) -- tell packet_hex_decoder its
-        # input is already at bit_rate so it doesn't decimate again.
-        # Everyone else (OOK/BPSK) still hands packet_hex_decoder a
-        # full-rate stream, so it does its usual samp_rate/bit_rate
-        # decimation as before.
+        # FM0/Miller already output one sample/bit (RX_ALREADY_AT_BIT_RATE)
+        # -- tell the decoder not to decimate again. OOK/BPSK still get
+        # the normal samp_rate/bit_rate decimation.
         decoder_samp_rate = (
             tag_kwargs["bit_rate"] if rx_type in RX_ALREADY_AT_BIT_RATE else SAMP_RATE
         )
@@ -506,77 +387,35 @@ class BackscatterMiddleware:
 
 class TopologyMiddleware:
     """
-    Builds a gr.top_block from a generic {"nodes", "edges"} description
-    instead of BackscatterMiddleware's fixed shape -- the foundation for
-    an eventual drag-and-drop canvas UI. Deliberately validated here with
-    hand-written topology dicts, no UI involved (see
-    Test/test_topology_plan.py for the pure wiring-logic check, and
-    Test/test_topology_middleware.py for a real run that reproduces
-    BackscatterMiddleware's current 2-tag OOK setup and should decode
-    the same way).
+    Builds a gr.top_block from a generic {"nodes", "edges"} spec --
+    foundation for the canvas UI. Additive; doesn't change
+    BackscatterMiddleware/ui/main_window.py's existing path.
 
-    This is additive, same as BackscatterMiddleware was to
-    multi_tag_middleware.py -- nothing here changes what ui/main_window.py
-    runs today.
+    nodes: [{"id", "type" (a registry.NODE_TYPES key), "params" (optional
+        overrides), "payload" (list[0/1], required for tag_* except
+        tag_analog -- per-run data, not a registry Param)}, ...]
 
-    nodes: list of dicts, each
-        {"id": str, "type": a key in registry.NODE_TYPES,
-         "params": dict (optional; overrides registry defaults),
-         "payload": list[0/1] (required for any "tag_*" node except
-                     tag_analog; this is per-run DATA, not an RF/timing
-                     Param, so it isn't in registry.py -- same thing
-                     tag_specs's "payload" key already is for
-                     BackscatterMiddleware)}
+    edges: [(from_id, from_port_name, to_id, to_port_name), ...]. Port
+        names resolve to gnuradio's positional wiring via _port_index().
 
-    edges: list of (from_id, from_port_name, to_id, to_port_name) tuples.
-        Port names are whatever registry.NODE_TYPES lists for that node
-        type (e.g. "Carrier_In", "Data_Out") -- see plan_topology()/
-        _port_index() for how a name resolves to gnuradio's actual
-        positional wiring.
+    Plumbing built automatically (not part of the spec, since no one
+    dragging blocks onto a canvas would place these themselves):
+      - blocks.throttle after every sender's Carrier_Out (port 0) only --
+        Tx_Leakage_Out (port 1) stays unthrottled so the rx's leakage
+        reference arrives at full speed.
+      - a constant-zero complex source wired into any channel's
+        Interference_In that's left unconnected.
+      - fan-in: multiple edges into the same (node, port) are summed via
+        a sized blocks.add_cc() instead of requiring an explicit adder
+        node. Complex ports only -- fanning into byte/float raises
+        rather than guessing.
+      - one queue.Queue() per packet_hex_decoder node (self.packet_queues,
+        keyed by node id); get_packets() tags each drained packet with
+        its decoder id so multi-receiver topologies stay attributable.
 
-    Plumbing that's NOT a node in the spec, built automatically, because
-    no one dragging blocks onto a canvas would place these themselves:
-      - blocks.throttle after every "sender" node's port-0 output
-        (Carrier_Out) only -- matching exactly where BackscatterMiddleware
-        puts it today. Port 1 (Tx_Leakage_Out) is deliberately NOT
-        throttled, also matching today: the leakage reference needs to
-        reach the rx at full speed, unthrottled, same as the existing
-        `self.tb.connect((sender, 1), (rx, 1))` line.
-      - a constant zero complex source (blocks.vector_source_c([0j], True))
-        wired into any "channel" node's Interference_In that no edge
-        targets -- today's fwd_channel/ret_channel both leave this
-        unconnected to anything real, so a topology that doesn't mention
-        Interference_In gets the same thing BackscatterMiddleware already
-        builds (zero_source_a / zero_source_b).
-      - fan-in: when more than one edge targets the same (node, port),
-        they're summed with blocks.add_cc() sized to however many edges
-        land there, instead of requiring an explicit adder node. This
-        generalizes today's hardcoded "every tag always sums into one
-        adder" rule to "any multiply-wired input sums" -- which is the
-        natural reading of dragging two tags onto a canvas and wiring both
-        to the same channel input. Only complex ports are supported; a
-        topology that fans multiple edges into a byte or float port raises
-        rather than guessing what that should mean.
-      - packet_queue for every "packet_hex_decoder" node: not a registry
-        Param (see its runtime_params entry) -- this class creates one
-        queue.Queue() PER decoder node (self.packet_queues, keyed by
-        that decoder's own node id) and hands each decoder its own.
-        get_packets() tags every packet it drains with the decoder id
-        it came from, so a topology with more than one receiver -- the
-        actual, no-longer-theoretical case canvas_window.py's
-        auto-created "decoder_<rx_id>" per receiver produces -- lets the
-        caller tell them apart instead of getting one interleaved
-        stream with no origin. (This used to be a single shared queue
-        with that limitation flagged here as unsolved; it's solved now.)
-
-    NOT handled, same limitation BackscatterMiddleware already has:
-      - tag_analog's different Signal_In/float payload shape -- a "type"
-        of "tag_analog" raises NotImplementedError, same reasoning as
-        BackscatterMiddleware's constructor.
-      - a port that's simply never wired and isn't a channel's
-        Interference_In (e.g. a tag with no Carrier_In edge) -- raises
-        when gnuradio's hier_block2 complains about an unconnected
-        required port, rather than silently building something partial.
+    Not handled: tag_analog (raises NotImplementedError, different
+    payload shape); an unwired required port (raises via gnuradio's own
+    hier_block2 check) other than a channel's Interference_In.
     """
 
     def __init__(self, nodes, edges):
@@ -588,23 +427,21 @@ class TopologyMiddleware:
         # Keyed by the decoder's own node id (e.g. "decoder_rx_ook1"),
         # the same id get_packets() tags each drained packet with.
         self.packet_queues = {}
-        # One message_framer.FragmentReassembler per decoder too (same
-        # key) -- only actually FED anything in get_packets() for a
-        # decoder_id that ends up in self._framed_decoders below (i.e.
-        # at least one upstream tag is in "text" mode and transmitting
-        # message_framer-framed fragments, not just raw hand-typed
-        # bits); built for every decoder regardless so get_packets()
-        # never has to special-case a missing entry.
+        # One FragmentReassembler per decoder, built unconditionally so
+        # get_packets() never has to special-case a missing entry --
+        # only actually fed when that decoder is in self._framed_decoders.
         self.reassemblers = {}
-        # Which decoders actually have a framed (text-mode) tag feeding
-        # them -- see get_packets()'s docstring. Resolved by
-        # plan_topology() itself now (its own "framed_decoders" key),
-        # alongside "tag_frame_bits" (each tag's exact preamble-resolved,
-        # fragment-concatenated bits -- see that function's docstring
-        # for the full "which decoder governs this tag" story, moved
-        # there from here so it's pure, gnuradio-free logic that can be
-        # tested on its own, same as everything else plan_topology does).
+        # Which decoders have a framed (text-mode) tag feeding them --
+        # resolved by plan_topology()'s "framed_decoders" key.
         self._framed_decoders = set(plan["framed_decoders"])
+        # Ground truth for bit-error-rate checking (ui/canvas_window.py's
+        # poll_packets()/_compute_packet_ber()): the EXACT bits each tag
+        # actually transmits, preamble included, already computed once by
+        # plan_topology() to build that tag's vector_source_b in the first
+        # place -- kept here (not recomputed) so BER comparisons always
+        # match what was literally fed into the flowgraph for this run,
+        # not a fresh re-derivation that could drift from it.
+        self.tag_frame_bits = plan["tag_frame_bits"]
         self.tb = gr.top_block()
         self._blocks = []
         self.nodes = {}          # node_id -> the real block, for direct
@@ -687,35 +524,34 @@ class TopologyMiddleware:
         self.tb.wait()
 
     def get_packets(self):
-        """Drains every decoder's own queue (see self.packet_queues) and
-        returns one flat list, each packet dict tagged with a
-        'decoder_id' key -- the packet_hex_decoder node id it actually
-        came from (e.g. "decoder_rx_ook1", canvas_window.py's own
-        "decoder_<rx_node_id>" naming) -- so a caller with more than one
-        receiver on the canvas can tell them apart instead of getting
-        one merged, unattributed stream. The tag is added HERE, not by
-        the decoder block itself -- packet_hex_decoder_epy_block_0.py
-        doesn't need to know its own node id at all, it just drains
-        whichever queue.Queue() this class handed it at construction.
+        """Drains every decoder's queue into one flat list, each packet
+        tagged with its source decoder_id (added here, not by the
+        decoder block itself, so multi-receiver topologies stay
+        attributable).
 
-        Each packet also gets a 'message' key -- None on every fragment
-        that doesn't, on its own, complete a message (the common case:
-        most fragments just join a still-in-progress buffer), or
-        {"tag_id": int, "bytes": bytes, "text": str} the moment THIS
-        fragment is the one that completes its tag's message (see
-        message_framer.FragmentReassembler.feed_hex()). Only decoders in
-        self._framed_decoders (at least one upstream tag is actually
-        transmitting message_framer-framed fragments, not just raw
-        hand-typed bits) run their fragments through reassembly at all
-        -- an ordinary raw-bits tag's hex essentially never happens to
-        also look like a valid header+CRC, but there's no reason to
-        even risk a false "reassembled" hit on a receiver nothing framed
-        is feeding. 'text' decodes the reassembled bytes as UTF-8 with
-        errors="replace" rather than raising, since a header corrupted
-        in a way the CRC didn't catch (the CRC only covers the chunk,
-        not tag_id/frag_index/frag_count/used_bytes themselves) or
-        genuinely non-text payload data shouldn't take the whole poller
-        down with it."""
+        Each packet also gets a 'message' key: None for an in-progress
+        fragment, or {"tag_id", "bytes", "text"} the moment a fragment
+        completes reassembly. Only decoders in self._framed_decoders run
+        reassembly at all, to avoid a false hit on a receiver nothing
+        framed is feeding. 'text' decodes as UTF-8 with errors="replace"
+        so corrupted/non-text payloads don't crash the poller.
+
+        Also adds, for every packet (not just the one that completes a
+        message): 'sim_header' -- None for a raw/non-framed decoder, or
+        {"tag_id", "frag_index", "frag_count", "used_bytes", "crc_ok"}
+        for a framed one, straight from message_framer.
+        parse_fragment_hex() -- and 'payload_hex'/'payload_ascii', the
+        hex/ASCII of ONLY the chunk (i.e. what the user actually typed/
+        chose), as opposed to 'hex'/'ascii' which are the decoder's raw
+        header+chunk dump. This is purely a display concern (see
+        canvas_window.py's Fragments table) -- the reassembler below
+        still runs on the full parse, unaffected by any of this. A
+        framed packet whose hex fails to even parse (shouldn't happen
+        in practice -- the decoder's payload_len_bits is set to exactly
+        HEADER_BYTES+chunk_bytes for a framed tag) falls back to
+        sim_header=None, payload_hex/ascii == hex/ascii, same as a raw
+        decoder -- so a display caller never needs a None-check beyond
+        what it already does for sim_header itself."""
         packets = []
         for decoder_id, decoder_queue in self.packet_queues.items():
             is_framed = decoder_id in self._framed_decoders
@@ -728,15 +564,30 @@ class TopologyMiddleware:
                 pkt = dict(pkt)
                 pkt["decoder_id"] = decoder_id
                 pkt["message"] = None
-                if is_framed and reassembler is not None:
-                    completed = reassembler.feed_hex(pkt.get("hex", ""))
-                    if completed is not None:
-                        tag_id, message_bytes = completed
-                        pkt["message"] = {
-                            "tag_id": tag_id,
-                            "bytes": message_bytes,
-                            "text": message_bytes.decode("utf-8", errors="replace"),
-                        }
+                pkt["sim_header"] = None
+                pkt["payload_hex"] = pkt.get("hex")
+                pkt["payload_ascii"] = pkt.get("ascii")
+
+                parsed = message_framer.parse_fragment_hex(pkt.get("hex", "")) if is_framed else None
+                if parsed is not None:
+                    pkt["sim_header"] = {
+                        "tag_id": parsed["tag_id"], "frag_index": parsed["frag_index"],
+                        "frag_count": parsed["frag_count"], "used_bytes": parsed["used_bytes"],
+                        "crc_ok": parsed["crc_ok"],
+                    }
+                    pkt["payload_hex"] = " ".join(f"{b:02X}" for b in parsed["chunk"])
+                    pkt["payload_ascii"] = "".join(
+                        chr(b) if 32 <= b <= 126 else "." for b in parsed["chunk"]
+                    )
+                    if reassembler is not None:
+                        completed = reassembler.feed_parsed(parsed)
+                        if completed is not None:
+                            tag_id, message_bytes = completed
+                            pkt["message"] = {
+                                "tag_id": tag_id,
+                                "bytes": message_bytes,
+                                "text": message_bytes.decode("utf-8", errors="replace"),
+                            }
                 packets.append(pkt)
         return packets
 
@@ -752,72 +603,40 @@ def build_fixed_topology(modulation, tag_specs, sender_params=None,
                           fwd_channel_params=None, ret_channel_params=None,
                           tag_params=None, rx_params=None, decoder_params=None):
     """
-    Builds the (nodes, edges) spec for TopologyMiddleware that reproduces
-    BackscatterMiddleware's fixed shape -- sender -> fwd channel -> fan out
-    to N tags -> fan in -> ret channel -> rx -> decoder -- as a
-    TopologyMiddleware topology instead of BackscatterMiddleware's own
-    hardcoded gr.top_block construction. This is what proves
-    TopologyMiddleware can fully stand in for BackscatterMiddleware, not
-    just run alongside it.
+    Builds the (nodes, edges) TopologyMiddleware spec that reproduces
+    BackscatterMiddleware's fixed shape (sender -> fwd channel -> fan out
+    to N tags -> fan in -> ret channel -> rx -> decoder), proving
+    TopologyMiddleware can fully stand in for it.
 
-    Every *_params argument is a dict of overrides for exactly the node it's
-    named after -- nothing here is split into some separate top-level
-    "common params" tier. `distance` is a ret_channel_params entry because
-    it IS a channel param (see registry.NODE_TYPES["channel"]), not a
-    BackscatterMiddleware-level concept; same for si_isolation_db under
-    rx_params. BackscatterMiddleware's own flat distance=/si_isolation_db=
-    kwargs aren't a real category scheme -- they exist because that's
-    specifically what ui/main_window.py's interim form needs direct access
-    to (one Setup field, one Live-adjustable field), not a reflection of
-    which params matter more. A caller that wants that same shortcut can
-    still build it one layer up (e.g. `ret_channel_params={"distance": d}`),
-    this function just doesn't bake the shortcut in.
+    Each *_params dict overrides exactly the node it's named after (e.g.
+    `distance` lives under ret_channel_params since it's a channel Param,
+    not a top-level concept).
 
-    modulation, tag_specs: same meaning as BackscatterMiddleware's own
-        (modulation is one of registry.MODULATION_MAP's keys, not yet
-        "Analog"; tag_specs is [{"slot_id":.., "payload":[0/1,...]}, ...],
-        every tag's payload the same length).
+    modulation, tag_specs: same meaning as BackscatterMiddleware's.
 
-    sender_params: overrides for the one sender node. Defaults to
-        {"enable_gated": 1} -- NOT the registry/raw-block default (0): see
-        backscatter_sender.py's blocks_selector_0 -- enable_gated=0 outputs
-        the raw, never-PIE-modulated carrier, which gives tags no slot
-        timing at all (confirmed by hand the hard way in
-        Test/test_topology_middleware.py's first draft). Baking this in
-        here means a caller can no longer forget it the way that draft did.
+    sender_params: defaults to {"enable_gated": 1} -- NOT the raw-block
+        default (0), which outputs an un-PIE-modulated carrier and gives
+        tags no slot timing at all.
 
-    fwd_channel_params: overrides for the forward channel. Defaults to
-        {"distance": 1, "noise_volt_c1": 0.02} -- BackscatterMiddleware's
-        own fixed, validated forward-channel values ("matching working
-        canvas" per its comment), not the registry's plain defaults (which
-        are actually the RETURN channel's values).
+    fwd_channel_params: defaults to {"distance": 1, "noise_volt_c1": 0.02}
+        -- BackscatterMiddleware's validated forward-channel values (the
+        registry's plain defaults are actually the RETURN channel's).
 
-    ret_channel_params: overrides for the return channel. No defaults
-        baked in beyond the registry's own (distance=2, noise_volt_c1=0.01)
-        -- this is the channel meant to be tweaked, live-adjustable via
-        TopologyMiddleware.get_node("ret_channel").set_distance(...), same
-        mechanism as BackscatterMiddleware.set_distance().
+    ret_channel_params: no extra defaults beyond the registry's own --
+        this is the channel meant to be tweaked live via
+        get_node("ret_channel").set_distance(...).
 
-    tag_params: overrides merged on top of DEFAULT_TAG_OVERRIDES for every
-        tag (e.g. {"m": 4} for Miller) -- same role as
-        BackscatterMiddleware's extra_tag_overrides.
+    tag_params: merged onto DEFAULT_TAG_OVERRIDES for every tag.
 
-    rx_params: overrides for the rx node, applied AFTER two automatic
-        steps: the tag->rx param sync (bit_rate/m/samp_rate, whichever
-        names the tag and rx types actually share -- same sync
-        BackscatterMiddleware already does, so they can't silently drift
-        apart; pass a DIFFERENT value here than tag_params's to deliberately
-        mismatch them, e.g. tag m=2 vs rx m=8, to test what a mismatch
-        actually does), and si_isolation_db defaulting to
-        SI_ISOLATION_DEFAULTS[modulation] (so switching modulations gets
-        the right isolation value without the caller needing to already
-        know it -- pass it here to override that default).
+    rx_params: applied after two automatic steps: tag->rx param sync
+        (bit_rate/m/samp_rate, whichever names are shared -- pass a
+        different value here than tag_params to deliberately mismatch
+        them for testing), and si_isolation_db defaulting to
+        SI_ISOLATION_DEFAULTS[modulation].
 
-    decoder_params: overrides for the decoder node, applied AFTER the
-        automatic bit_rate/payload_len_bits/samp_rate derivation (the
-        RX_ALREADY_AT_BIT_RATE logic, same as BackscatterMiddleware) --
-        an escape hatch, not something meant to be set routinely; matches
-        the "not up to the user much" expectation already true today.
+    decoder_params: applied after the automatic bit_rate/payload_len_bits/
+        samp_rate derivation (RX_ALREADY_AT_BIT_RATE) -- an escape hatch,
+        not for routine use.
     """
     if modulation not in registry.MODULATION_MAP:
         raise ValueError(
