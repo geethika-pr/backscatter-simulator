@@ -26,7 +26,9 @@ class tag_pie_decoder(gr.sync_block):
         self.bit_rate = float(bit_rate)
         self.packet_len_bits = int(packet_len_bits)
         self.tari_us = float(tari_us)
-        self.threshold = float(threshold)
+        self.threshold = float(threshold)   # now a FRACTION of the carrier level (0.6 = 60%)
+        self.ref_level = 0.0                # running carrier level (peak follower)
+        self.ref_decay = 0.9999             # how slowly ref_level forgets (~5 ms at 2 MHz)
         self.enable_mac = bool(enable_mac)
         self.slot_id = int(slot_id)
 
@@ -153,7 +155,11 @@ class tag_pie_decoder(gr.sync_block):
                 gate_out[i] = 0.0
                 sample_mag = mag[i]
 
-                if sample_mag < self.threshold:
+                # Track the carrier level: jump up instantly, sink back very slowly,
+                # so short PIE notches don't drag the reference down.
+                self.ref_level = max(sample_mag, self.ref_level * self.ref_decay)
+
+                if sample_mag < self.threshold * self.ref_level:
                     if not self.in_notch:
                         if self.high_count >= 6:
                             bit = 1 if self.high_count >= self.decision_boundary else 0

@@ -26,7 +26,10 @@ class harvesting_gate(gr.sync_block):
         current_pwr = float(np.mean(np.real(rf_in)**2 + np.imag(rf_in)**2))
 
         # Smooth with EMA to prevent instantaneous phase/noise dips from flickering the tag
-        self.avg_pwr = (1.0 - self.alpha) * self.avg_pwr + self.alpha * current_pwr
+        # Apply alpha once per SAMPLE, not once per buffer, so smoothing speed
+        # is real time instead of depending on GNU Radio's buffer size.
+        alpha_eff = 1.0 - (1.0 - self.alpha) ** len(rf_in)
+        self.avg_pwr = (1.0 - alpha_eff) * self.avg_pwr + alpha_eff * current_pwr
 
         # Gate the modulating control signal
         if self.avg_pwr >= self.p_th:

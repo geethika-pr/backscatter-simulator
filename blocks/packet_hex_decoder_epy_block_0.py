@@ -4,7 +4,7 @@ import time
 
 class packet_hex_decoder(gr.sync_block):
     def __init__(self, preamble="10101011", payload_len_bits=16,
-                 samp_rate=2e6, bit_rate=40e3, packet_queue=None):
+        samp_rate=2e6, bit_rate=40e3, packet_queue=None, accept_inverted=False):
         gr.sync_block.__init__(
             self,
             name="Packet Hex & ASCII Decoder",
@@ -12,6 +12,14 @@ class packet_hex_decoder(gr.sync_block):
             out_sig=None
         )
         self.preamble = [int(b) for b in preamble]
+
+        # Costas-loop phase tracking can lock 180 deg off for BPSK, which inverts
+        # every bit. If enabled, an inverted preamble also starts a packet and
+        # the payload is flipped back.
+        self.accept_inverted = bool(accept_inverted)
+        self.inv_preamble = [1 - b for b in self.preamble]
+        self.invert = False
+
         self.payload_len_bits = int(payload_len_bits)
         self.samp_rate = float(samp_rate)
         self.bit_rate = float(bit_rate)
@@ -45,12 +53,17 @@ class packet_hex_decoder(gr.sync_block):
                 if len(self.shift_reg) > len(self.preamble):
                     self.shift_reg.pop(0)
                 if self.shift_reg == self.preamble:
+                    self.invert = False
                     self.state = "COLLECTING"
                     self.collected_bits = []
                     self.shift_reg = []
-
+                elif self.accept_inverted and self.shift_reg == self.inv_preamble:
+                    self.invert = True
+                    self.state = "COLLECTING"
+                    self.collected_bits = []
+                    self.shift_reg = []
             elif self.state == "COLLECTING":
-                self.collected_bits.append(bit)
+                self.collected_bits.append(bit ^ 1 if self.invert else bit)
                 if len(self.collected_bits) >= self.payload_len_bits:
                     self._dispatch_packet(self.collected_bits)
                     self.state = "SEARCHING"

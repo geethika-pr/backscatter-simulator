@@ -62,6 +62,8 @@ import os
 
 import core.registry as registry
 import core.message_framer as message_framer
+import core.units as units
+import core.ber_theory as ber_theory
 from core.modulation_middleware import (
     plan_topology, TopologyMiddleware, DEFAULT_TAG_OVERRIDES, SI_ISOLATION_DEFAULTS,
     SAMP_RATE, RX_ALREADY_AT_BIT_RATE, PREAMBLE_BITS, PREAMBLE,
@@ -171,7 +173,69 @@ DECODE_RANGE_SNR_THRESHOLD_DB = 6.0
 # someone using the UI, whatever it is further down), writing back int
 # 0/1 rather than True/False to match the registry default's own type
 # exactly, in case a constructor is strict about it.
-BOOLEAN_INT_PARAMS = {"enable_gated", "si_enable", "enable_mac"}
+BOOLEAN_INT_PARAMS = {"enable_gated", "si_enable", "enable_mac", "accept_inverted", "model_phase", "enable_avg"}
+
+# Receivers whose blocks have the moving-average stage (enable_avg/avg_len)
+AVERAGING_RX_TYPES = {"rx_ook", "rx_bpsk", "rx_fm0", "rx_miller"}
+
+_AVG_AUTO_TOOLTIP = (
+    "Auto: the averaging length is recomputed from the bit rate whenever this panel "
+    "opens or you press Start -- OOK/BPSK: half a bit; FM0: an eighth of a bit; "
+    "Miller-M: 1/(8M) of a bit (FM0/Miller decoders sample at fixed points inside "
+    "each half-period, so they need more margin).\n"
+    "Untick to type your own length. Too long smears neighbouring levels together and "
+    "causes errors even with no noise; longer (within that limit) = less noise: "
+    "+10*log10(length) dB.\n\n"
+    "Averaging is OFF by default for now: it only helps when the decoder samples the "
+    "middle of each bit, and the current decoders don't choose their sampling point "
+    "that way yet (in tests, results got worse about half the time)."
+)
+
+# Decoder settings whose sensible default depends on the receiver type,
+# applied on top of packet_hex_decoder's registry defaults when a receiver
+# is created AND when a receiver's modulation is switched (the old type's
+# choice may be wrong for the new one). accept_inverted: BPSK's Costas loop
+# can lock 180 deg off, inverting every bit -- see registry.py.
+DECODER_DEFAULTS_BY_RX = {
+    "rx_bpsk": {"accept_inverted": 1},
+}
+
+# Params the inspector SHOWS in dBm while the stored value (node.params /
+# edge.channel_params, layout JSON, and what the GNU Radio block receives)
+# stays the exact same raw number as before -- conversion happens only
+# inside the widget (see _make_dbm_widget() and core/units.py for the
+# |x|**2 = watts convention). So old layouts, the wake/decode rings and
+# the flowgraph are all untouched by this; only what a person reads and
+# types changes. Per-param: (min dBm, max dBm, explanation for tooltip).
+# The min doubles as an "Off" sentinel (raw value 0): no noise / always
+# awake / no carrier.
+DBM_OFF_SENTINEL = -250.0
+DBM_PARAM_SPECS = {
+    "tx_power_send": (
+        DBM_OFF_SENTINEL, 70.0,
+        "Transmit power of the sender's carrier, in dBm.\n"
+        "Real UHF RFID readers: ~30 dBm (1 W) conducted, up to ~36 dBm EIRP.\n"
+        "Stored/sent to the block as an AMPLITUDE: sqrt(P_watts) "
+        "(|x|^2 = watts convention, core/units.py)."),
+    "noise_volt_c1": (
+        DBM_OFF_SENTINEL, 60.0,
+        "Noise power this channel adds, in dBm, measured across the WHOLE "
+        "sample-rate bandwidth (noise is added per sample).\n"
+        f"Reference at {SAMP_RATE / 1e6:g} MHz: thermal floor kTB = "
+        f"{units.thermal_noise_dbm(SAMP_RATE):.1f} dBm; with a 7 dB receiver "
+        f"noise figure = {units.thermal_noise_dbm(SAMP_RATE, 7.0):.1f} dBm.\n"
+        "Each +3 dB doubles the noise power; +6 dB doubles the noise voltage.\n"
+        "Stored/sent to the block as a noise VOLTAGE (amplitude): sqrt(P_watts)."),
+    "p_th": (
+        DBM_OFF_SENTINEL, 60.0,
+        "Minimum carrier power the tag needs at its antenna to wake up "
+        "(its sensitivity), in dBm.\n"
+        "Real tags: about -14 to -23 dBm for passive RFID chips, around "
+        "-42 dBm for semi-passive wake-up receivers (Wang et al., JSSC 2020).\n"
+        "Stored/sent to the block as POWER in watts (harvesting_gate compares "
+        "it with mean(|x|^2))."),
+}
+DBM_DECIMALS = 2
 
 # Per-param override for how many decimal places a float QDoubleSpinBox
 # shows (make_param_widget()'s default is 4, which reads as needless
@@ -313,7 +377,7 @@ def _tag_identity_color(order_seq):
     return QtGui.QColor.fromHsv(hue, 210, 230)
 
 
-def _wake_up_radius_m(tx_power_send, p_th, freq, g_reader_dbi, g_tag_dbi):
+def _wake_up_radius_m(tx_power_send, p_th, freq, g_reader_dbi, g_tag_dbi, path_loss_exp=2.0):
     """Forward-leg-only wake-up radius (meters): the distance at which a
     tag stops receiving enough power to turn on at all, given this
     sender's tx_power_send and this edge's channel settings. Says
@@ -332,10 +396,17 @@ def _wake_up_radius_m(tx_power_send, p_th, freq, g_reader_dbi, g_tag_dbi):
         return float("inf")
     c_light = 3e8
     gain_const = (10 ** ((g_reader_dbi + g_tag_dbi) / 20.0)) * (c_light / freq) / (4.0 * 3.14159265)
-    return max(0.0, (float(tx_power_send) * gain_const) / (p_th ** 0.5))
+    # r0 = the free-space answer. Path-loss exponent revision: inside 1 m
+    # the block is free space, so r0 stands; beyond 1 m the amplitude
+    # falls as d**(-n/2), so solving tx*K*d**(-n/2) = sqrt(p_th) gives
+    # r0**(2/n). Both agree at r0 = 1, and n = 2 gives r0 everywhere.
+    r0 = max(0.0, (float(tx_power_send) * gain_const) / (p_th ** 0.5))
+    if r0 < 1.0:
+        return r0
+    return r0 ** (2.0 / float(path_loss_exp))
 
 
-def _harvested_power(tx_power_send, distance_m, freq, g_reader_dbi, g_tag_dbi):
+def _harvested_power(tx_power_send, distance_m, freq, g_reader_dbi, g_tag_dbi, path_loss_exp=2.0):
     """Power arriving at a tag `distance_m` meters from its sender --
     the forward evaluation of the same Friis estimate _wake_up_radius_m()
     inverts (same best-case, noise/fading-excluded caveat applies).
@@ -344,14 +415,29 @@ def _harvested_power(tx_power_send, distance_m, freq, g_reader_dbi, g_tag_dbi):
     _update_energy_info_label(). Kept separate from _wake_up_radius_m()
     since that one solves for distance, this one evaluates at a known
     distance."""
-    distance_m = max(float(distance_m), 0.05)  # same floor backscatter_channel_1.py uses
+    # same 0.05 m floor and same free-space-below-1-m / d**(-n/2)-beyond
+    # shape as backscatter_channel_1.py (see _distance_amplitude_factor)
     c_light = 3e8
     gain_const = (10 ** ((g_reader_dbi + g_tag_dbi) / 20.0)) * (c_light / freq) / (4.0 * 3.14159265)
-    amplitude = float(tx_power_send) * gain_const / distance_m
+    amplitude = float(tx_power_send) * gain_const * _distance_amplitude_factor(distance_m, path_loss_exp)
     return amplitude ** 2
 
 
-def _friis_amplitude_gain(distance_m, freq, g_reader_dbi, g_tag_dbi):
+def _distance_amplitude_factor(distance_m, path_loss_exp=2.0):
+    """Distance part of one hop's AMPLITUDE gain, mirroring
+    backscatter_channel_1's friis_gain exactly (path-loss exponent
+    revision, calibration-plan item 4): free space (1/d, with the block's
+    own 0.05 m floor) below 1 m, then d**(-n/2) from 1 m on -- n/2
+    because the block scales amplitude and n is defined on power. The
+    two pieces meet at d = 1 m (both 1.0), so n = 2 reproduces the old
+    plain-Friis 1/d everywhere."""
+    d = float(distance_m)
+    if d < 1.0:
+        return 1.0 / max(d, 0.05)
+    return d ** (-float(path_loss_exp) / 2.0)
+
+
+def _friis_amplitude_gain(distance_m, freq, g_reader_dbi, g_tag_dbi, path_loss_exp=2.0):
     """One-way Friis amplitude gain of a single hop at a known distance
     -- the same gain_const/distance split _wake_up_radius_m() and
     _harvested_power() both already use (confirmed against
@@ -363,10 +449,9 @@ def _friis_amplitude_gain(distance_m, freq, g_reader_dbi, g_tag_dbi):
     refactor _wake_up_radius_m()/_harvested_power() themselves -- those
     are already independently verified (ui/test_wake_up_range_formula.py)
     and not worth the regression risk of touching for this."""
-    distance_m = max(float(distance_m), 0.05)
     c_light = 3e8
     gain_const = (10 ** ((g_reader_dbi + g_tag_dbi) / 20.0)) * (c_light / freq) / (4.0 * 3.14159265)
-    return gain_const / distance_m
+    return gain_const * _distance_amplitude_factor(distance_m, path_loss_exp)
 
 
 def _reflection_swing_mag(gamma0_mag, gamma0_phase_deg, gamma1_mag, gamma1_phase_deg):
@@ -388,7 +473,7 @@ def _decode_snr_db(distance_m, tx_power_send,
                     fwd_freq, fwd_g_reader_dbi, fwd_g_tag_dbi,
                     gamma0_mag, gamma0_phase_deg, gamma1_mag, gamma1_phase_deg,
                     ret_freq, ret_g_reader_dbi, ret_g_tag_dbi, ret_noise_volt_c1,
-                    fwd_distance_m=None):
+                    fwd_distance_m=None, fwd_path_loss_exp=2.0, ret_path_loss_exp=2.0):
     """SNR (dB) of the information-bearing backscattered signal arriving
     back at the receiver, `distance_m` meters out on the return leg --
     the return-leg, SNR-flavored counterpart to _harvested_power()'s
@@ -413,9 +498,11 @@ def _decode_snr_db(distance_m, tx_power_send,
     delta_gamma_mag = _reflection_swing_mag(
         gamma0_mag, gamma0_phase_deg, gamma1_mag, gamma1_phase_deg)
     signal = (float(tx_power_send)
-              * _friis_amplitude_gain(fwd_distance_m, fwd_freq, fwd_g_reader_dbi, fwd_g_tag_dbi)
+              * _friis_amplitude_gain(fwd_distance_m, fwd_freq, fwd_g_reader_dbi, fwd_g_tag_dbi,
+                                      fwd_path_loss_exp)
               * delta_gamma_mag
-              * _friis_amplitude_gain(distance_m, ret_freq, ret_g_reader_dbi, ret_g_tag_dbi))
+              * _friis_amplitude_gain(distance_m, ret_freq, ret_g_reader_dbi, ret_g_tag_dbi,
+                                      ret_path_loss_exp))
     if ret_noise_volt_c1 <= 0:
         return float("inf")
     if signal <= 0:
@@ -427,7 +514,7 @@ def _decode_range_m(tx_power_send,
                      fwd_freq, fwd_g_reader_dbi, fwd_g_tag_dbi,
                      gamma0_mag, gamma0_phase_deg, gamma1_mag, gamma1_phase_deg,
                      ret_freq, ret_g_reader_dbi, ret_g_tag_dbi, ret_noise_volt_c1,
-                     snr_threshold_db=6.0):
+                     snr_threshold_db=6.0, fwd_path_loss_exp=2.0, ret_path_loss_exp=2.0):
     """Closed-form maximum SYMMETRIC round-trip distance (same d on both
     the forward and return leg -- see _decode_snr_db()'s docstring for
     why that's the right default) at which the backscattered signal's
@@ -468,8 +555,17 @@ def _decode_range_m(tx_power_send,
     k_ret = _friis_amplitude_gain(1.0, ret_freq, ret_g_reader_dbi, ret_g_tag_dbi)
     c_budget = float(tx_power_send) * delta_gamma_mag * k_fwd * k_ret
     threshold_linear = 10 ** (snr_threshold_db / 10.0)
-    d_pow4 = (c_budget ** 2) / ((float(ret_noise_volt_c1) ** 2) * threshold_linear)
-    return d_pow4 ** 0.25
+    # Path-loss exponent revision: the round-trip distance factor is
+    # 1/d**2 below 1 m (both hops free space) and d**(-(n_f+n_r)/2)
+    # beyond (see _distance_amplitude_factor). Setting signal/noise =
+    # sqrt(threshold) needs factor = 1/T, so d = sqrt(T) inside 1 m and
+    # T**(2/(n_f+n_r)) beyond. With both exponents 2 this is exactly the
+    # original quartic inversion, d = (c^2/(noise^2*thr))**0.25 = sqrt(T).
+    t_ratio = c_budget / (float(ret_noise_volt_c1) * threshold_linear ** 0.5)
+    d_free = t_ratio ** 0.5
+    if d_free < 1.0:
+        return d_free
+    return t_ratio ** (2.0 / (float(fwd_path_loss_exp) + float(ret_path_loss_exp)))
 
 
 def _switch_energy_per_bit_joules(mode, vdd, c_gate_f=None, r_bias_ohm=None,
@@ -854,6 +950,14 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         # info() recomputes it again against the REAL wired preamble the
         # first time this tag's inspector panel is shown or edited.
         self.packets_per_wake = 3 if type_name.startswith("tag_") else None
+        # Tag Loss (dB) -- see _apply_tag_loss(). 0.0 for any tag (no
+        # loss, identical to before this existed), None otherwise.
+        self.tag_loss_db = 0.0 if type_name.startswith("tag_") else None
+        # Receiver averaging length auto-fill (see _sync_decoder_params()
+        # and core.ber_theory.recommended_avg_len()). True/False on
+        # receivers that have the averaging stage, None otherwise.
+        # UI-side only, never sent to a block.
+        self.avg_len_auto = True if type_name in AVERAGING_RX_TYPES else None
         if self.packets_per_wake is not None:
             self.params["packet_bits"] = self.packets_per_wake * self.full_cycle_bits(len(PREAMBLE))
 
@@ -919,6 +1023,8 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
             {p.name: p.default for p in registry.NODE_TYPES["packet_hex_decoder"].params}
             if type_name.startswith("rx_") else None
         )
+        if self.decoder_params is not None:
+            self.decoder_params.update(DECODER_DEFAULTS_BY_RX.get(type_name, {}))
 
         # Auto-wired names are already filtered out above, so none of
         # these are ever auto_wired=True -- that constructor arg is kept
@@ -1406,6 +1512,98 @@ class NoScrollComboBox(_NoScrollMixin, QtWidgets.QComboBox):
     pass
 
 
+# Tag Loss (dB): a UI-side setting on every tag, NOT a registry Param and
+# NOT a GNU Radio block parameter (_build_node() hands every registry Param
+# to the block constructor, which has no such argument). complex_gamma_
+# modulator outputs carrier * (A_s - Gamma), so a loss L inside the tag
+# (switch insertion loss, cables, antenna mismatch, conversion loss) is
+# exactly a common factor 10**(-L/20) on A_s, Gamma0 and Gamma1 together.
+# Scaling all of them by the same factor keeps the modulation's SHAPE
+# (OOK: same direction, different length; BPSK: equal and opposite) and
+# only shrinks its SIZE. Applied in scene_to_topology() (what the block
+# receives) and wherever the rings/SNR read tag gammas, so both stay in
+# sync. calibration-plan item 5; values: Ryu 2026 switch ~1.1 dB +
+# cables ~1.5 dB, Wang 2020 SSB chip ~15 dB, Liu 2025 COTS FSK tag ~22.6 dB.
+TAG_LOSS_SCALED_PARAMS = ("gamma0_mag", "gamma1_mag", "as_real", "as_imag",
+                          "custom_g0_magnitude", "custom_g1_mag")
+
+
+def _apply_tag_loss(params, tag_loss_db):
+    """Copy of a tag's params with TAG_LOSS_SCALED_PARAMS multiplied by
+    10**(-tag_loss_db/20). tag_loss_db None/0 -> unchanged copy. Phases
+    are untouched (a loss shrinks, it doesn't rotate)."""
+    out = dict(params)
+    try:
+        loss = float(tag_loss_db or 0.0)
+    except (TypeError, ValueError):
+        loss = 0.0
+    if loss == 0.0:
+        return out
+    factor = 10.0 ** (-loss / 20.0)
+    for key in TAG_LOSS_SCALED_PARAMS:
+        if key in out and out[key] is not None:
+            try:
+                out[key] = float(out[key]) * factor
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
+def _dbm_tooltip(name, raw_value):
+    """Static explanation + the live raw number actually going into the
+    block, so the conversion is never hidden."""
+    raw = float(raw_value)
+    if name in units.AMPLITUDE_PARAMS:
+        live = f"Currently sent to the block as: amplitude {raw:.4g}  (= {raw * raw:.4g} W)"
+    else:
+        live = f"Currently sent to the block as: {raw:.4g} W"
+    return DBM_PARAM_SPECS[name][2] + "\n\n" + live
+
+
+def _make_dbm_widget(name, current_value, on_change):
+    """dBm spinbox for one of DBM_PARAM_SPECS. Shows dBm, writes back the
+    RAW block value (amplitude or watts, see core/units.py) through the
+    same on_change(name, value) every other widget uses -- so callers
+    (node params, channel params, reader halves) need no changes.
+
+    Only writes back when the shown dBm actually changed: editingFinished
+    also fires on a plain focus-out, and converting a 2-decimal display
+    back to raw would otherwise silently nudge an untouched value (e.g.
+    raw 20 -> 56.02 dBm -> 19.9998)."""
+    lo, hi, _doc = DBM_PARAM_SPECS[name]
+    w = NoScrollDoubleSpinBox()
+    w.setDecimals(DBM_DECIMALS)
+    w.setRange(lo, hi)
+    w.setSingleStep(1.0)
+    w.setSuffix(" dBm")
+    # shown instead of the number when the box sits at its minimum
+    w.setSpecialValueText("Off (0)")
+    try:
+        raw = float(current_value)
+    except (TypeError, ValueError):
+        raw = 0.0
+    dbm = units.raw_to_dbm(name, raw)
+    if not math.isfinite(dbm) or dbm < lo:
+        dbm = lo
+    elif dbm > hi:
+        dbm = hi
+    w.setValue(dbm)
+    w._shown_dbm = w.value()          # what's on screen right now (rounded)
+    w.setToolTip(_dbm_tooltip(name, raw))
+
+    def _commit(n=name, box=w):
+        new_dbm = box.value()
+        if abs(new_dbm - box._shown_dbm) < 0.5 * 10 ** (-DBM_DECIMALS):
+            return  # unchanged (focus-out) -- keep the exact stored raw value
+        box._shown_dbm = new_dbm
+        new_raw = 0.0 if new_dbm <= lo else units.dbm_to_raw(n, new_dbm)
+        box.setToolTip(_dbm_tooltip(n, new_raw))
+        on_change(n, new_raw)
+
+    w.editingFinished.connect(_commit)
+    return w
+
+
 def make_param_widget(name, current_value, on_change):
     """Builds the one widget for a single registry Param, dispatched by
     name (ENUM_PARAMS / BOOLEAN_INT_PARAMS) and then by the Python type
@@ -1430,6 +1628,8 @@ def make_param_widget(name, current_value, on_change):
         w.setChecked(bool(current_value))
         w.stateChanged.connect(lambda _state, n=name, box=w: on_change(n, int(box.isChecked())))
         return w
+    if name in DBM_PARAM_SPECS:
+        return _make_dbm_widget(name, current_value, on_change)
     # bool before int: Python's bool is an int subclass, so this order
     # matters even though no current registry Param defaults to a bool
     # -- future-proofing, not dead code by accident.
@@ -1468,6 +1668,17 @@ def make_param_widget(name, current_value, on_change):
         w.editingFinished.connect(lambda n=name, box=w: on_change(n, box.text()))
     return w
 
+
+_ACCEPT_INVERTED_TOOLTIP = (
+    "Also start a packet when the bit-INVERTED preamble arrives, and flip that "
+    "packet's bits back.\n\n"
+    "Why: the receiver's phase tracker (Costas loop) can lock 180 degrees off. "
+    "For BPSK that turns every 0 into a 1 and vice versa, so the normal preamble "
+    "never matches and nothing decodes. On by default for BPSK receivers.\n"
+    "FM0 and Miller carry data in transitions, so inversion doesn't affect them; "
+    "OOK has no phase tracking. Leave it off for those: accepting a second "
+    "pattern doubles the chance of a false packet start on noise."
+)
 
 _PAYLOAD_LEN_BITS_TOOLTIP = (
     "Auto-derived from whatever tag(s) feed this receiver -- not something to "
@@ -1990,6 +2201,33 @@ class NodeInspector(QtWidgets.QWidget):
         self.scroll_layout.addWidget(self.packets_per_wake_label)
         self.scroll_layout.addWidget(self.packets_per_wake_spin)
 
+        # Tag Loss (dB) -- tag-only, NodeItem.tag_loss_db, see
+        # _apply_tag_loss(). Persistent widget like Packets to Send.
+        self.tag_loss_label = QtWidgets.QLabel("Tag Loss (dB)")
+        self.tag_loss_spin = NoScrollDoubleSpinBox()
+        self.tag_loss_spin.setRange(0.0, 60.0)
+        self.tag_loss_spin.setDecimals(1)
+        self.tag_loss_spin.setSingleStep(0.5)
+        self.tag_loss_spin.setSuffix(" dB")
+        _tag_loss_tip = (
+            "Power lost inside the tag before its reflection leaves the antenna: "
+            "switch insertion loss, cables/connectors, antenna mismatch, and for "
+            "frequency-shifting tags the conversion loss.\n\n"
+            "Shrinks Gamma 0, Gamma 1 and the structural scattering by the SAME "
+            "factor (10^(-loss/20)) before they reach the block, so the modulation's "
+            "shape (OOK strong/weak, BPSK equal/opposite) is kept and only its size "
+            "drops. Your typed Gamma values are not changed. The rings and BER plot "
+            "use the same scaled values.\n\n"
+            "Leave at 0 if your Gamma values were measured at the antenna port "
+            "(they already include these losses).\n"
+            "Reference: switch ~1.1 dB + cables ~1.5 dB (Ryu 2026); SSB chip ~15 dB "
+            "(Wang 2020); commercial FSK tag ~22.6 dB (Liu 2025).")
+        self.tag_loss_label.setToolTip(_tag_loss_tip)
+        self.tag_loss_spin.setToolTip(_tag_loss_tip)
+        self.tag_loss_spin.valueChanged.connect(self._on_tag_loss_changed)
+        self.scroll_layout.addWidget(self.tag_loss_label)
+        self.scroll_layout.addWidget(self.tag_loss_spin)
+
         # Energy model -- tag-only; see _update_energy_info_label().
         # NodeItem attributes, not registry Params, not read by any
         # GNU Radio block (claude/energy-consumption-estimate.md).
@@ -2209,6 +2447,8 @@ class NodeInspector(QtWidgets.QWidget):
             self.preamble_info_label.setVisible(False)
             self.packets_per_wake_label.setVisible(False)
             self.packets_per_wake_spin.setVisible(False)
+            self.tag_loss_label.setVisible(False)
+            self.tag_loss_spin.setVisible(False)
             self.energy_group.setVisible(False)
             self.ports_label.setText("")
             return
@@ -2322,6 +2562,13 @@ class NodeInspector(QtWidgets.QWidget):
             # loop creates it from node_item.params.get("packet_bits", ...).
             self._update_packets_per_wake_info(node_item)
 
+        self.tag_loss_label.setVisible(is_tag)
+        self.tag_loss_spin.setVisible(is_tag)
+        if is_tag:
+            self.tag_loss_spin.blockSignals(True)
+            self.tag_loss_spin.setValue(float(node_item.tag_loss_db or 0.0))
+            self.tag_loss_spin.blockSignals(False)
+
         self.energy_group.setVisible(is_tag)
         if is_tag:
             mode_idx = self.energy_mode_combo.findData(node_item.energy_switch_mode)
@@ -2420,6 +2667,8 @@ class NodeInspector(QtWidgets.QWidget):
             if not advanced_toggle_inserted and not p.basic:
                 self._insert_advanced_toggle_row()
                 advanced_toggle_inserted = True
+            if p.name == "avg_len" and getattr(node_item, "avg_len_auto", None) is not None:
+                self._add_avg_auto_row(node_item, widget, not p.basic)
             self._add_param_row(p.label or p.name, widget, not p.basic)
             self.param_widgets[p.name] = widget
         if not advanced_toggle_inserted:
@@ -2459,6 +2708,8 @@ class NodeInspector(QtWidgets.QWidget):
                         "to set by hand. Edit bit rate on the tag or this receiver "
                         "itself instead."
                     )
+                elif p.name == "accept_inverted":
+                    widget.setToolTip(_ACCEPT_INVERTED_TOOLTIP)
                 elif p.name == "preamble":
                     widget.setToolTip(
                         "What this receiver's decoder hunts for, AND what every "
@@ -2493,6 +2744,8 @@ class NodeInspector(QtWidgets.QWidget):
                 widget = make_param_widget(
                     p.name, reader_rx_item.params.get(p.name, p.default),
                     self._on_reader_rx_param_changed)
+                if p.name == "avg_len" and getattr(reader_rx_item, "avg_len_auto", None) is not None:
+                    self._add_avg_auto_row(reader_rx_item, widget, not p.basic)
                 self._add_param_row(p.label or p.name, widget, not p.basic)
                 self.reader_rx_param_widgets[p.name] = widget
 
@@ -2593,6 +2846,8 @@ class NodeInspector(QtWidgets.QWidget):
         self.preamble_info_label.setVisible(False)
         self.packets_per_wake_label.setVisible(False)
         self.packets_per_wake_spin.setVisible(False)
+        self.tag_loss_label.setVisible(False)
+        self.tag_loss_spin.setVisible(False)
         self.energy_group.setVisible(False)
 
         ch_nt = registry.NODE_TYPES["channel"]
@@ -2713,7 +2968,19 @@ class NodeInspector(QtWidgets.QWidget):
         is also tracked for the toggle and starts matching the toggle's
         current state, so switching nodes while "Show advanced" is on
         doesn't visually reset it. The one place that reads Param.basic
-        -- applies uniformly to every node/edge type, no special-casing."""
+        -- applies uniformly to every node/edge type, no special-casing.
+
+        Checkboxes (BOOLEAN_INT_PARAMS widgets) are laid out as ONE row
+        with the box in front of its own text ("[x] Label"), the same style
+        as the "View signal" checkboxes -- not WrapAllRows' label-on-one-
+        row, box-on-the-next stacking."""
+        if isinstance(widget, QtWidgets.QCheckBox):
+            widget.setText(label_text)
+            self.params_form.addRow(widget)
+            if is_advanced:
+                self._advanced_param_rows.append((None, widget))
+                widget.setVisible(self._show_advanced)
+            return
         self.params_form.addRow(label_text, widget)
         if is_advanced:
             label_widget = self.params_form.labelForField(widget)
@@ -2746,16 +3013,43 @@ class NodeInspector(QtWidgets.QWidget):
         column to register here (addRow() takes the one composite
         widget), so the whole row_widget (label + checkbox together)
         is what gets hidden/shown."""
-        row_widget = QtWidgets.QWidget()
-        row_layout = QtWidgets.QHBoxLayout(row_widget)
-        row_layout.setContentsMargins(0, 0, 0, 0)
-        row_layout.addWidget(QtWidgets.QLabel(label_text))
-        row_layout.addWidget(checkbox_widget)
-        row_layout.addStretch(1)
-        self.params_form.addRow(row_widget)
+        # Box in front of its text, one row ("[x] Label") -- same style as
+        # the "View signal" checkboxes (was label first, box after it).
+        checkbox_widget.setText(label_text)
+        self.params_form.addRow(checkbox_widget)
         if is_advanced:
-            self._advanced_param_rows.append((None, row_widget))
-            row_widget.setVisible(self._show_advanced)
+            self._advanced_param_rows.append((None, checkbox_widget))
+            checkbox_widget.setVisible(self._show_advanced)
+
+    def _add_avg_auto_row(self, receiver_item, avg_len_widget, is_advanced):
+        """"Auto (from bit rate)" checkbox placed right above the receiver's
+        Averaging Length field (standalone rx or a reader's hidden rx).
+        Ticked: the length field is greyed out and filled by
+        _sync_decoder_params(); unticked: the field is editable."""
+        box = QtWidgets.QCheckBox()
+        box.setChecked(bool(receiver_item.avg_len_auto))
+        box.setToolTip(_AVG_AUTO_TOOLTIP)
+        avg_len_widget.setEnabled(not receiver_item.avg_len_auto)
+        if receiver_item.avg_len_auto:
+            avg_len_widget.setToolTip("Filled automatically from the bit rate -- untick "
+                                      "'Auto' above to set it by hand.\n\n" + _AVG_AUTO_TOOLTIP)
+        box.toggled.connect(
+            lambda checked, rx=receiver_item, w=avg_len_widget: self._on_avg_auto_toggled(rx, w, checked))
+        self._add_inline_checkbox_row("Averaging Length: Auto (from bit rate)", box, is_advanced)
+
+    def _on_avg_auto_toggled(self, receiver_item, avg_len_widget, checked):
+        receiver_item.avg_len_auto = bool(checked)
+        avg_len_widget.setEnabled(not checked)
+        if checked:
+            self.window._sync_decoder_params(
+                receiver_item, self.window._find_upstream_tags(receiver_item), notify=False)
+            avg_len_widget.blockSignals(True)
+            avg_len_widget.setValue(int(receiver_item.params.get("avg_len", 1)))
+            avg_len_widget.blockSignals(False)
+            avg_len_widget.setToolTip("Filled automatically from the bit rate -- untick "
+                                      "'Auto' above to set it by hand.\n\n" + _AVG_AUTO_TOOLTIP)
+        else:
+            avg_len_widget.setToolTip(_AVG_AUTO_TOOLTIP)
 
     def _add_decode_range_controls(self, receiver_item):
         """Builds the "Show decode range" checkbox + "Decode SNR
@@ -2906,6 +3200,14 @@ class NodeInspector(QtWidgets.QWidget):
         if self.current_edge is None or self.current_edge.channel_params is None:
             return
         self.current_edge.channel_params[name] = value
+        # A combined reader's hidden return leg (reader_shadow) is the
+        # SAME physical path as this visible edge. update_edges_for_node()
+        # only copied settings across on a drag, so editing e.g. noise,
+        # gains or the path-loss exponent here used to leave the return
+        # leg (and the decode ring) on stale values until something moved.
+        shadow = getattr(self.current_edge, "reader_shadow", None)
+        if shadow is not None and shadow.channel_params is not None:
+            shadow.channel_params[name] = value
         # freq/g_reader_dbi/g_tag_dbi all feed _wake_up_radius_m() too --
         # same reasoning as _on_param_changed() above, always refresh
         # rather than special-casing which param names matter. The
@@ -3020,6 +3322,13 @@ class NodeInspector(QtWidgets.QWidget):
         self._update_message_info_label()
         self._update_energy_info_label()
         self._update_packets_per_wake_info(self.current_node)
+
+    def _on_tag_loss_changed(self, value):
+        if self.current_node is None or self.current_node.tag_loss_db is None:
+            return
+        self.current_node.tag_loss_db = float(value)
+        # the decode ring reads the loss-scaled gammas
+        self.window._update_wake_ranges()
 
     def _on_packets_per_wake_changed(self, value):
         if self.current_node is None:
@@ -3323,7 +3632,8 @@ class NodeInspector(QtWidgets.QWidget):
             else:
                 power = _harvested_power(
                     float(tx_power_send), float(distance), float(freq),
-                    float(g_reader_dbi), float(g_tag_dbi))
+                    float(g_reader_dbi), float(g_tag_dbi),
+                    float(fwd_edge.channel_params.get("path_loss_exp", 2.0)))
                 if p_th is not None and power < float(p_th):
                     self.energy_harvest_value_label.setText("Harvested: 0 units")
                     self.energy_harvest_desc_label.setText(
@@ -3568,6 +3878,7 @@ class CanvasWindow(QtWidgets.QMainWindow):
     def add_node(self, type_name, scene_pos, node_id=None, params=None, payload=None,
                  decoder_params=None, payload_mode=None, message_text=None, chunk_bytes=None,
                  file_bytes=None, file_name=None, order_seq=None, packets_per_wake=None,
+                 tag_loss_db=None, avg_len_auto=None,
                  energy_per_bit=None, energy_static_rate=None,
                  energy_switch_mode=None, energy_c_gate_fF=None, energy_vdd=None,
                  energy_r_bias_ohm=None, energy_duty_cycle=None,
@@ -3617,6 +3928,10 @@ class CanvasWindow(QtWidgets.QMainWindow):
             item.file_bytes = file_bytes
         if file_name is not None and item.file_name is not None:
             item.file_name = file_name
+        if tag_loss_db is not None and item.tag_loss_db is not None:
+            item.tag_loss_db = float(tag_loss_db)
+        if avg_len_auto is not None and item.avg_len_auto is not None:
+            item.avg_len_auto = bool(avg_len_auto)
         if packets_per_wake is not None and item.packets_per_wake is not None:
             # Explicit intent -- a fresh node whose caller actually
             # knows a packets_per_wake value (paste_clipboard(),
@@ -3940,7 +4255,8 @@ class CanvasWindow(QtWidgets.QMainWindow):
                 p_th = tag.params.get("p_th")
                 radius_m = (
                     _wake_up_radius_m(float(tx_power_send), float(p_th), float(freq),
-                                       float(g_reader_dbi), float(g_tag_dbi))
+                                       float(g_reader_dbi), float(g_tag_dbi),
+                                       float(edge.channel_params.get("path_loss_exp", 2.0)))
                     if tx_power_send is not None and p_th is not None and freq
                     else float("inf"))
                 if radius_m > 0 and radius_m != float("inf"):
@@ -4029,9 +4345,10 @@ class CanvasWindow(QtWidgets.QMainWindow):
                 if ring_drawn_for_tag:
                     tag.set_identity_highlight(color)
                 continue
-            gamma0_mag = tag.params.get("gamma0_mag")
-            gamma0_phase_deg = tag.params.get("gamma0_phase_deg")
-            gamma1_mag = tag.params.get("gamma1_mag")
+            tag_eff = _apply_tag_loss(tag.params, tag.tag_loss_db)  # same values the block gets
+            gamma0_mag = tag_eff.get("gamma0_mag")
+            gamma0_phase_deg = tag_eff.get("gamma0_phase_deg")
+            gamma1_mag = tag_eff.get("gamma1_mag")
             gamma1_phase_deg = tag.params.get("gamma1_phase_deg")
             ret_freq = ret_edge.channel_params.get("freq")
             ret_g_reader_dbi = ret_edge.channel_params.get("g_reader_dbi")
@@ -4058,7 +4375,9 @@ class CanvasWindow(QtWidgets.QMainWindow):
                 float(gamma1_mag), float(gamma1_phase_deg),
                 float(ret_freq), float(ret_g_reader_dbi), float(ret_g_tag_dbi),
                 float(ret_noise_volt_c1),
-                snr_threshold_db=snr_threshold_db)
+                snr_threshold_db=snr_threshold_db,
+                fwd_path_loss_exp=float(edge.channel_params.get("path_loss_exp", 2.0)),
+                ret_path_loss_exp=float(ret_edge.channel_params.get("path_loss_exp", 2.0)))
             if not (decode_radius_m > 0) or decode_radius_m == float("inf"):
                 if ring_drawn_for_tag:
                     tag.set_identity_highlight(color)
@@ -4328,6 +4647,8 @@ class CanvasWindow(QtWidgets.QMainWindow):
             "file_bytes": node.file_bytes,
             "file_name": node.file_name,
             "packets_per_wake": node.packets_per_wake,
+            "tag_loss_db": node.tag_loss_db,
+            "avg_len_auto": node.avg_len_auto,
             "energy_per_bit": node.energy_per_bit,
             "energy_switch_mode": node.energy_switch_mode,
             "energy_c_gate_fF": node.energy_c_gate_fF,
@@ -4363,6 +4684,8 @@ class CanvasWindow(QtWidgets.QMainWindow):
                                   chunk_bytes=clip["chunk_bytes"], file_bytes=clip["file_bytes"],
                                   file_name=clip["file_name"],
                                   packets_per_wake=clip.get("packets_per_wake"),
+                                  tag_loss_db=clip.get("tag_loss_db"),
+                                  avg_len_auto=clip.get("avg_len_auto"),
                                   energy_per_bit=clip.get("energy_per_bit"),
                                   energy_switch_mode=clip.get("energy_switch_mode"),
                                   energy_c_gate_fF=clip.get("energy_c_gate_fF"),
@@ -4530,6 +4853,7 @@ class CanvasWindow(QtWidgets.QMainWindow):
         # the shared-param carryover logic above) is always overwritten
         # by that fresh derivation.
         packets_per_wake = node_item.packets_per_wake
+        tag_loss_db = node_item.tag_loss_db
         # order_seq carries over too -- see NodeItem.order_seq's own
         # comment and add_node()'s order_seq param: without this, the
         # rebuilt item would get a BRAND NEW (later) order_seq, which
@@ -4545,6 +4869,15 @@ class CanvasWindow(QtWidgets.QMainWindow):
         # switch between rx types has no reason to reset it, unlike
         # `params` above which genuinely needs type-aware remapping.
         decoder_params = dict(node_item.decoder_params) if node_item.decoder_params is not None else None
+        # ...except settings whose right value depends on the receiver
+        # TYPE (DECODER_DEFAULTS_BY_RX): reset to the NEW type's default,
+        # e.g. switching OOK -> BPSK turns accept_inverted on, BPSK -> OOK
+        # turns it off. Without this, an OOK receiver switched to BPSK
+        # would keep accept_inverted=0 and decode nothing whenever its
+        # Costas loop happened to lock upside down.
+        if decoder_params is not None and new_type_name.startswith("rx_"):
+            decoder_params["accept_inverted"] = 0
+            decoder_params.update(DECODER_DEFAULTS_BY_RX.get(new_type_name, {}))
         rect = node_item.rect()
         center = node_item.pos() + QtCore.QPointF(rect.width() / 2, rect.height() / 2)
         was_selected = node_item.isSelected()
@@ -4587,6 +4920,7 @@ class CanvasWindow(QtWidgets.QMainWindow):
                                   chunk_bytes=chunk_bytes, file_bytes=file_bytes,
                                   file_name=file_name, order_seq=order_seq,
                                   packets_per_wake=packets_per_wake,
+                                  tag_loss_db=tag_loss_db,
                                   add_to_scene=reader_partner is None)
         if reader_partner is not None:
             new_item.reader_partner = reader_partner
@@ -4784,6 +5118,14 @@ class CanvasWindow(QtWidgets.QMainWindow):
                         7000)
 
             decoder_bit_rate = bit_rate
+            if getattr(rx_item, "avg_len_auto", None) and "avg_len" in rx_item.params:
+                auto_len = ber_theory.recommended_avg_len(
+                    rx_item.type_name, bit_rate,
+                    rx_item.params.get("samp_rate", SAMP_RATE),
+                    rx_item.params.get("m", 2))
+                if rx_item.params.get("avg_len") != auto_len:
+                    rx_item.params["avg_len"] = auto_len
+                    changed = True
             decoder_samp_rate = (bit_rate if rx_item.type_name in RX_ALREADY_AT_BIT_RATE
                                   else SAMP_RATE)
             if (rx_item.decoder_params.get("bit_rate") != decoder_bit_rate
@@ -4803,7 +5145,12 @@ class CanvasWindow(QtWidgets.QMainWindow):
                           # ALREADY-built dict instead of a second pass
                           # over self.nodes.
         for node_id, item in self.nodes.items():
-            n = {"id": node_id, "type": item.type_name, "params": dict(item.params)}
+            # tags: gammas/structural scattering scaled by Tag Loss here,
+            # so the block gets the lossy values while item.params keeps
+            # what the user typed (see _apply_tag_loss())
+            params = (_apply_tag_loss(item.params, item.tag_loss_db)
+                      if item.tag_loss_db is not None else dict(item.params))
+            n = {"id": node_id, "type": item.type_name, "params": params}
             if item.payload is not None:
                 n["payload"] = list(item.payload)
             nodes.append(n)
@@ -4924,6 +5271,10 @@ class CanvasWindow(QtWidgets.QMainWindow):
             }
             if item.payload is not None:
                 n["payload"] = list(item.payload)
+            if item.tag_loss_db is not None:
+                n["tag_loss_db"] = item.tag_loss_db
+            if item.avg_len_auto is not None:
+                n["avg_len_auto"] = item.avg_len_auto
             if item.decoder_params is not None:
                 n["decoder_params"] = dict(item.decoder_params)
             if item.payload_mode is not None:
@@ -5036,6 +5387,11 @@ class CanvasWindow(QtWidgets.QMainWindow):
                 # None falls back to add_node()'s own fresh-tag default
                 # (3), same reasoning as order_seq just above.
                 packets_per_wake=n.get("packets_per_wake"),
+                # missing on layouts saved before Tag Loss existed ->
+                # None -> add_node() keeps the fresh-tag default 0.0
+                tag_loss_db=n.get("tag_loss_db"),
+                # missing on older layouts -> None -> receiver default (Auto on)
+                avg_len_auto=n.get("avg_len_auto"),
                 energy_per_bit=n.get("energy_per_bit"),
                 energy_switch_mode=n.get("energy_switch_mode"),
                 energy_c_gate_fF=n.get("energy_c_gate_fF"),
@@ -5782,55 +6138,109 @@ class CanvasWindow(QtWidgets.QMainWindow):
             return
         self.status.showMessage(f"Exported rows {start}-{end} ({end - start + 1} row(s)) to {path}", 5000)
 
-    def _resolve_decode_snr_db_for_tag(self, tag, rx):
-        """Resolves every _decode_snr_db() param for tag's CURRENT link
-        to rx, the exact same lookup _update_wake_ranges() already does
-        to draw the decode-range ring (same forward/return edge search,
-        same tag gamma0/1 params, same channel_params keys) -- so the
-        number this returns is always the same SNR that ring would be
-        drawn at for this tag/receiver pair, right now, nothing
-        re-derived differently. Returns None if the tag isn't fully
-        wired for the calculation yet (missing forward or return edge,
-        that return edge not actually ending at `rx`, or any edge/tag
-        param absent) -- same missing-data guard _update_wake_ranges()
-        already uses before drawing."""
+    def _resolve_link_params_for_tag(self, tag, rx):
+        """Every setting that decides how strong `tag`'s signal is at
+        `rx` right now, looked up the same way _update_wake_ranges()
+        does for the decode-range ring (same forward/return edge search,
+        same tag gamma params, same channel_params keys). Returns a dict
+        of floats, or None if the tag isn't fully wired yet (missing
+        forward or return edge, that return edge not ending at `rx`, or
+        any needed param absent). Shared by _resolve_decode_snr_db_for_
+        tag() (the ring's SNR) and _capture_ber_snr_point() (the BER
+        plot's SNR), so both always read identical settings."""
         fwd_edge = next((e for e in self.edges if e.role == "forward" and e.to_node is tag), None)
         if fwd_edge is None or fwd_edge.channel_params is None:
             return None
         sender = fwd_edge.from_node
-        tx_power_send = sender.params.get("tx_power_send")
-        fwd_freq = fwd_edge.channel_params.get("freq")
-        fwd_g_reader_dbi = fwd_edge.channel_params.get("g_reader_dbi")
-        fwd_g_tag_dbi = fwd_edge.channel_params.get("g_tag_dbi")
-        fwd_distance_m = fwd_edge.channel_params.get("distance")
-
         ret_edge = next((e for e in self.edges if e.role == "return" and e.from_node is tag), None)
         if ret_edge is None or ret_edge.channel_params is None or ret_edge.to_node is not rx:
             return None
-        ret_freq = ret_edge.channel_params.get("freq")
-        ret_g_reader_dbi = ret_edge.channel_params.get("g_reader_dbi")
-        ret_g_tag_dbi = ret_edge.channel_params.get("g_tag_dbi")
-        ret_noise_volt_c1 = ret_edge.channel_params.get("noise_volt_c1")
-        ret_distance_m = ret_edge.channel_params.get("distance")
-
-        gamma0_mag = tag.params.get("gamma0_mag")
-        gamma0_phase_deg = tag.params.get("gamma0_phase_deg")
-        gamma1_mag = tag.params.get("gamma1_mag")
-        gamma1_phase_deg = tag.params.get("gamma1_phase_deg")
-
-        if (tx_power_send is None or not fwd_freq or fwd_distance_m is None
-                or gamma0_mag is None or gamma1_mag is None
-                or not ret_freq or ret_noise_volt_c1 is None or ret_distance_m is None):
+        fwd, ret = fwd_edge.channel_params, ret_edge.channel_params
+        tag_eff = _apply_tag_loss(tag.params, tag.tag_loss_db)  # same values the block gets
+        raw = {
+            "tx_power_send": sender.params.get("tx_power_send"),
+            "fwd_freq": fwd.get("freq"),
+            "fwd_g_reader_dbi": fwd.get("g_reader_dbi"),
+            "fwd_g_tag_dbi": fwd.get("g_tag_dbi"),
+            "fwd_distance_m": fwd.get("distance"),
+            "ret_freq": ret.get("freq"),
+            "ret_g_reader_dbi": ret.get("g_reader_dbi"),
+            "ret_g_tag_dbi": ret.get("g_tag_dbi"),
+            "ret_noise_volt_c1": ret.get("noise_volt_c1"),
+            "ret_distance_m": ret.get("distance"),
+            # path-loss exponent per leg (absent on layouts saved before
+            # it existed -> 2.0, plain Friis, same as the block default)
+            "fwd_path_loss_exp": fwd.get("path_loss_exp", 2.0),
+            "ret_path_loss_exp": ret.get("path_loss_exp", 2.0),
+            "gamma0_mag": tag_eff.get("gamma0_mag"),
+            "gamma0_phase_deg": tag_eff.get("gamma0_phase_deg"),
+            "gamma1_mag": tag_eff.get("gamma1_mag"),
+            "gamma1_phase_deg": tag_eff.get("gamma1_phase_deg"),
+            # structural scattering: absent on some tag types -> 0
+            "as_real": tag_eff.get("as_real", 0.0),
+            "as_imag": tag_eff.get("as_imag", 0.0),
+        }
+        if (raw["tx_power_send"] is None or not raw["fwd_freq"] or raw["fwd_distance_m"] is None
+                or raw["gamma0_mag"] is None or raw["gamma1_mag"] is None
+                or not raw["ret_freq"] or raw["ret_noise_volt_c1"] is None
+                or raw["ret_distance_m"] is None):
             return None
+        for key in ("fwd_path_loss_exp", "ret_path_loss_exp"):
+            if raw[key] is None:
+                raw[key] = 2.0
+        for key in ("gamma0_phase_deg", "gamma1_phase_deg", "as_real", "as_imag",
+                    "fwd_g_reader_dbi", "fwd_g_tag_dbi", "ret_g_reader_dbi", "ret_g_tag_dbi"):
+            if raw[key] is None:
+                raw[key] = 0.0
+        return {k: float(v) for k, v in raw.items()}
 
+    def _resolve_decode_snr_db_for_tag(self, tag, rx):
+        """The decode-range ring's SNR (full reflection swing vs return
+        noise, _decode_snr_db()) for tag's CURRENT link to rx -- the same
+        number that ring is drawn at. None if not fully wired (see
+        _resolve_link_params_for_tag()). NOT the BER plot's x-axis any
+        more: that uses core.ber_theory.decision_snr_db() (half the
+        level gap the slicer sees), see _capture_ber_snr_point()."""
+        lp = self._resolve_link_params_for_tag(tag, rx)
+        if lp is None:
+            return None
         return _decode_snr_db(
-            float(ret_distance_m), float(tx_power_send),
-            float(fwd_freq), float(fwd_g_reader_dbi), float(fwd_g_tag_dbi),
-            float(gamma0_mag), float(gamma0_phase_deg),
-            float(gamma1_mag), float(gamma1_phase_deg),
-            float(ret_freq), float(ret_g_reader_dbi), float(ret_g_tag_dbi),
-            float(ret_noise_volt_c1),
-            fwd_distance_m=float(fwd_distance_m))
+            lp["ret_distance_m"], lp["tx_power_send"],
+            lp["fwd_freq"], lp["fwd_g_reader_dbi"], lp["fwd_g_tag_dbi"],
+            lp["gamma0_mag"], lp["gamma0_phase_deg"],
+            lp["gamma1_mag"], lp["gamma1_phase_deg"],
+            lp["ret_freq"], lp["ret_g_reader_dbi"], lp["ret_g_tag_dbi"],
+            lp["ret_noise_volt_c1"],
+            fwd_distance_m=lp["fwd_distance_m"],
+            fwd_path_loss_exp=lp["fwd_path_loss_exp"],
+            ret_path_loss_exp=lp["ret_path_loss_exp"])
+
+    def _resolve_decision_snr_for_tag(self, tag, rx):
+        """The BER plot's SNR for tag's current link to rx: E = a^2 /
+        sigma^2 in dB (core.ber_theory's one definition -- a = half the
+        gap between the two levels THIS receiver type's slicer separates,
+        sigma^2 = return noise power), plus the OOK off_ratio the exact
+        OOK curve needs. Returns (e_db, off_ratio) or None if not wired."""
+        lp = self._resolve_link_params_for_tag(tag, rx)
+        if lp is None:
+            return None
+        carrier_amp_at_rx = (
+            lp["tx_power_send"]
+            * _friis_amplitude_gain(lp["fwd_distance_m"], lp["fwd_freq"],
+                                    lp["fwd_g_reader_dbi"], lp["fwd_g_tag_dbi"],
+                                    lp["fwd_path_loss_exp"])
+            * _friis_amplitude_gain(lp["ret_distance_m"], lp["ret_freq"],
+                                    lp["ret_g_reader_dbi"], lp["ret_g_tag_dbi"],
+                                    lp["ret_path_loss_exp"]))
+        g0 = ber_theory.gamma_from_polar(lp["gamma0_mag"], lp["gamma0_phase_deg"])
+        g1 = ber_theory.gamma_from_polar(lp["gamma1_mag"], lp["gamma1_phase_deg"])
+        a_s = complex(lp["as_real"], lp["as_imag"])
+        n_avg = 1
+        if rx.type_name in AVERAGING_RX_TYPES and int(rx.params.get("enable_avg", 0) or 0):
+            n_avg = int(rx.params.get("avg_len", 1) or 1)
+        e_db = ber_theory.decision_snr_db(
+            rx.type_name, carrier_amp_at_rx, g0, g1, a_s, lp["ret_noise_volt_c1"], n_avg=n_avg)
+        return e_db, ber_theory.ook_off_ratio(g0, g1, a_s)
 
     def _capture_ber_snr_point(self, rx_node_id):
         """"Capture point" button, Fragments pane -- the in-app
@@ -5874,22 +6284,32 @@ class CanvasWindow(QtWidgets.QMainWindow):
                 f"for.")
             return
         tag = tag_items[0]
-        snr_db = self._resolve_decode_snr_db_for_tag(tag, rx)
-        if snr_db is None:
+        resolved = self._resolve_decision_snr_for_tag(tag, rx)
+        if resolved is None:
             QtWidgets.QMessageBox.information(
                 self, "Capture BER/SNR point",
                 "This tag isn't fully wired for an SNR calculation yet -- "
                 "needs a forward edge (from a sender) AND a return edge (to "
                 "this receiver), both with their channel settings filled in.")
             return
+        e_db, off_ratio = resolved
+        if not math.isfinite(e_db):
+            QtWidgets.QMessageBox.information(
+                self, "Capture BER/SNR point",
+                "The SNR for this link is "
+                + ("infinite (return-channel noise is Off)" if e_db > 0
+                   else "zero (the tag's two reflection states look identical to this receiver)")
+                + " -- a point there can't be drawn on a BER-vs-SNR plot.")
+            return
         ber = stats["errors"] / stats["bits"]
         self.ber_vs_snr_points[rx_node_id].append({
-            "snr_db": snr_db, "ber": ber,
+            "snr_db": e_db, "ber": ber,
             "n_wrong": stats["errors"], "n_bits": stats["bits"],
             "tag_id": tag.node_id,
+            "rx_type": rx.type_name, "off_ratio": off_ratio,
         })
         self.status.showMessage(
-            f"Captured point: SNR={snr_db:.2f} dB, BER={ber:.4g} "
+            f"Captured point: SNR={e_db:.2f} dB, BER={ber:.4g} "
             f"({stats['errors']}/{stats['bits']}) -- "
             f"{len(self.ber_vs_snr_points[rx_node_id])} point(s) so far for {rx_node_id}",
             6000)
@@ -5897,9 +6317,13 @@ class CanvasWindow(QtWidgets.QMainWindow):
     def _show_ber_vs_snr_plot(self, rx_node_id):
         """"Show BER vs SNR Plot" button, Fragments pane -- opens a
         plain matplotlib window (Geethika's own pick over an embedded
-        panel: simpler, free pan/zoom/save) with the three theoretical
-        curves (core.ber_theory.THEORETICAL_CURVES) plus every point
-        captured so far for this receiver via _capture_ber_snr_point().
+        panel: simpler, free pan/zoom/save) with the ONE theory curve
+        matching this receiver's type (core.ber_theory.CURVE_FOR_RX_TYPE;
+        none for FM0/Miller) plus every point captured so far for this
+        receiver via _capture_ber_snr_point(), all on the same SNR
+        definition (core.ber_theory's decision-point E). Rewritten
+        2026-11-11: the first version drew three curves in three
+        different SNR conventions and placed points in a fourth.
         A separate window, not tied to this dock -- capturing another
         point afterward doesn't live-update an already-open plot;
         re-click this button to see the new point on a fresh one."""
@@ -5912,29 +6336,87 @@ class CanvasWindow(QtWidgets.QMainWindow):
                 self, "Show BER vs SNR Plot",
                 f"matplotlib isn't installed in this environment: {e}")
             return
-        from core.ber_theory import THEORETICAL_CURVES
+        rx_node = self.nodes.get(rx_node_id)
+        rx_type = rx_node.type_name if rx_node is not None else None
+        curve_key = ber_theory.CURVE_FOR_RX_TYPE.get(rx_type)
 
         points = self.ber_vs_snr_points.get(rx_node_id, [])
-        snr_lo = min([-10.0] + [p["snr_db"] - 2 for p in points])
-        snr_hi = max([20.0] + [p["snr_db"] + 2 for p in points])
-        snr_range = [snr_lo + i * (snr_hi - snr_lo) / 399.0 for i in range(400)]
+        snr_lo = min([-5.0] + [p["snr_db"] - 2 for p in points])
+        snr_hi = max([15.0] + [p["snr_db"] + 2 for p in points])
+        snr_range = [snr_lo + i * (snr_hi - snr_lo) / 199.0 for i in range(200)]
 
-        fig, ax = plt.subplots(figsize=(7, 5.5))
-        for _key, (label, fn) in THEORETICAL_CURVES.items():
-            ax.semilogy(snr_range, [max(fn(s), 1e-300) for s in snr_range],
-                        label=label, linewidth=1.3)
-        if points:
-            xs = [p["snr_db"] for p in points]
-            ys = [max(p["ber"], 1e-300) for p in points]
+        # Floor for DRAWING only, never a stand-in for a real value: a
+        # run with 0 bit errors has a true BER of exactly 0, which a
+        # log-scale axis can't show at all, and a theory curve
+        # underflows to 0.0 at high SNR too. Floor from THIS plot's own
+        # data -- the smallest real nonzero measured BER, or the finest
+        # resolution a 0-error run could possibly have shown (1 error in
+        # n_bits) -- with a little headroom, so the axis only covers a
+        # range that's meaningful for what was measured (see
+        # claude/ber-measurement.md).
+        nonzero_pts = [p for p in points if p["n_wrong"] > 0]
+        zero_pts = [p for p in points if p["n_wrong"] == 0]
+        zero_bounds = [1.0 / p["n_bits"] for p in zero_pts if p["n_bits"]]
+        y_floor = min([1e-6] + [p["ber"] for p in nonzero_pts] + zero_bounds) * 0.3
+
+        def _above_floor(y):
+            # off the bottom of the chart -> not drawn (NaN), instead of a
+            # misleading flat line along the floor
+            return y if y >= y_floor else float("nan")
+
+        fig, ax = plt.subplots(figsize=(7.5, 6))
+        # ONE theory curve: the one matching this receiver type. For OOK
+        # the exact curve depends on how much the tag reflects in its
+        # "off" state, so draw one per distinct setting captured (usually
+        # one), or for the currently wired tag if nothing captured yet.
+        if curve_key == "bpsk":
+            label, fn = ber_theory.THEORETICAL_CURVES["bpsk"]
+            ax.semilogy(snr_range, [_above_floor(fn(x)) for x in snr_range],
+                        label=f"Theory: {label}", linewidth=1.6, color="#2c6fbb")
+        elif curve_key == "ook_envelope":
+            ratios = sorted({round(p.get("off_ratio", 0.0), 3) for p in points})
+            if not ratios and rx_node is not None:
+                tags = self._find_upstream_tags(rx_node)
+                if len(tags) == 1:
+                    resolved = self._resolve_decision_snr_for_tag(tags[0], rx_node)
+                    if resolved is not None:
+                        ratios = [round(resolved[1], 3)]
+            for r in (ratios or [0.0])[:3]:
+                label, fn = ber_theory.THEORETICAL_CURVES["ook_envelope"]
+                ax.semilogy(snr_range, [_above_floor(fn(x, r)) for x in snr_range],
+                            label=f"Theory: {label}, off/on reflection {r:.2f}",
+                            linewidth=1.6)
+        if nonzero_pts:
+            xs = [p["snr_db"] for p in nonzero_pts]
+            ys = [p["ber"] for p in nonzero_pts]
             ax.semilogy(xs, ys, "o", markersize=8, markeredgecolor="black",
-                        markeredgewidth=0.6,
-                        label=f"Measured ({rx_node_id}, {len(points)} point(s))")
-        else:
-            ax.text(0.5, 0.5, "No points captured yet -- click \"Capture point\" after a run",
-                    transform=ax.transAxes, ha="center", va="center", fontsize=9, color="gray")
-        ax.set_xlabel("SNR (dB)")
-        ax.set_ylabel("Bit Error Rate")
-        ax.set_title(f"BER vs SNR -- {rx_node_id}")
+                        markeredgewidth=0.6, color="#c0392b",
+                        label=f"Your runs ({rx_node_id}, {len(nonzero_pts)} point(s))")
+        if zero_pts:
+            # 0 errors observed is an UPPER BOUND on that run's true BER,
+            # not a precise measurement -- drawn as a distinct downward
+            # marker at the finest resolution that run could have shown.
+            xs = [p["snr_db"] for p in zero_pts]
+            ys = [max(1.0 / p["n_bits"], y_floor) if p["n_bits"] else y_floor for p in zero_pts]
+            ax.semilogy(xs, ys, "v", markersize=9, markeredgecolor="black",
+                        markeredgewidth=0.6, color="#27ae60",
+                        label=f"Runs with 0 errors ({len(zero_pts)}): true BER is below this")
+        notes = []
+        if curve_key is None:
+            notes.append(f"No textbook curve for {rx_type or 'this receiver'} "
+                         "(FM0/Miller depend on their own decoders) -- points only.")
+        if not points:
+            notes.append('No points yet: run the sim, then click "Capture point".')
+        if notes:
+            ax.text(0.5, 0.55, "\n".join(notes), transform=ax.transAxes,
+                    ha="center", va="center", fontsize=9, color="gray")
+        ax.set_xlabel("SNR at the receiver's decision point, after its averaging (dB)\n"
+                      "= (half the gap between the bit-0 and bit-1 levels)\u00b2 / noise power",
+                      fontsize=9)
+        ax.set_ylabel("Bit error rate (fraction of bits wrong)")
+        ax.set_title(f"BER vs SNR -- {rx_node_id} ({rx_type})")
+        ax.set_ylim(bottom=y_floor, top=1.0)
+        ax.set_xlim(snr_lo, snr_hi)
         ax.grid(True, which="both", alpha=0.3)
         ax.legend(fontsize=8, loc="lower left")
         fig.tight_layout()

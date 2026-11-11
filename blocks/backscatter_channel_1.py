@@ -14,6 +14,7 @@ from gnuradio import gr
 from gnuradio.fft import window
 import sys
 import signal
+import cmath
 import threading
 
 
@@ -23,7 +24,7 @@ import threading
 
 
 class backscatter_channel_1(gr.hier_block2):
-    def __init__(self, distance=2, fading_type_c1=0, freq=915e6, g_reader_dbi=6.0, g_tag_dbi=2.0, noise_volt_c1=0.01, samp_rate_c1=2e6):
+    def __init__(self, distance=2, fading_type_c1=0, freq=915e6, g_reader_dbi=6.0, g_tag_dbi=2.0, model_phase=0, noise_volt_c1=0.01, path_loss_exp=2.0, samp_rate_c1=2e6):
         gr.hier_block2.__init__(
             self, "Channel",
                 gr.io_signature.makev(2, 2, [gr.sizeof_gr_complex*1, gr.sizeof_gr_complex*1]),
@@ -38,13 +39,15 @@ class backscatter_channel_1(gr.hier_block2):
         self.freq = freq
         self.g_reader_dbi = g_reader_dbi
         self.g_tag_dbi = g_tag_dbi
+        self.model_phase = model_phase
         self.noise_volt_c1 = noise_volt_c1
+        self.path_loss_exp = path_loss_exp
         self.samp_rate_c1 = samp_rate_c1
 
         ##################################################
         # Variables
         ##################################################
-        self.friis_gain = friis_gain = (10**((g_reader_dbi + g_tag_dbi) / 20.0)) * (3e8 / freq) / (4.0 * 3.14159265 * max(float(distance), 0.05))
+        self.friis_gain = friis_gain = (10**((g_reader_dbi + g_tag_dbi) / 20.0)) * (3e8 / freq) / (4.0 * 3.14159265) * (1.0 / max(float(distance), 0.05) if float(distance) < 1.0 else float(distance) ** (-path_loss_exp / 2.0)) * cmath.exp(-2j * cmath.pi * float(distance) * freq / 3e8 * model_phase)
 
         ##################################################
         # Blocks
@@ -85,7 +88,7 @@ class backscatter_channel_1(gr.hier_block2):
 
     def set_distance(self, distance):
         self.distance = distance
-        self.set_friis_gain((10**((self.g_reader_dbi + self.g_tag_dbi) / 20.0)) * (3e8 / self.freq) / (4.0 * 3.14159265 * max(float(self.distance), 0.05)))
+        self.set_friis_gain((10**((self.g_reader_dbi + self.g_tag_dbi) / 20.0)) * (3e8 / self.freq) / (4.0 * 3.14159265) * (1.0 / max(float(self.distance), 0.05) if float(self.distance) < 1.0 else float(self.distance) ** (-self.path_loss_exp / 2.0)) * cmath.exp(-2j * cmath.pi * float(self.distance) * self.freq / 3e8 * self.model_phase))
 
     def get_fading_type_c1(self):
         return self.fading_type_c1
@@ -99,21 +102,28 @@ class backscatter_channel_1(gr.hier_block2):
 
     def set_freq(self, freq):
         self.freq = freq
-        self.set_friis_gain((10**((self.g_reader_dbi + self.g_tag_dbi) / 20.0)) * (3e8 / self.freq) / (4.0 * 3.14159265 * max(float(self.distance), 0.05)))
+        self.set_friis_gain((10**((self.g_reader_dbi + self.g_tag_dbi) / 20.0)) * (3e8 / self.freq) / (4.0 * 3.14159265) * (1.0 / max(float(self.distance), 0.05) if float(self.distance) < 1.0 else float(self.distance) ** (-self.path_loss_exp / 2.0)) * cmath.exp(-2j * cmath.pi * float(self.distance) * self.freq / 3e8 * self.model_phase))
 
     def get_g_reader_dbi(self):
         return self.g_reader_dbi
 
     def set_g_reader_dbi(self, g_reader_dbi):
         self.g_reader_dbi = g_reader_dbi
-        self.set_friis_gain((10**((self.g_reader_dbi + self.g_tag_dbi) / 20.0)) * (3e8 / self.freq) / (4.0 * 3.14159265 * max(float(self.distance), 0.05)))
+        self.set_friis_gain((10**((self.g_reader_dbi + self.g_tag_dbi) / 20.0)) * (3e8 / self.freq) / (4.0 * 3.14159265) * (1.0 / max(float(self.distance), 0.05) if float(self.distance) < 1.0 else float(self.distance) ** (-self.path_loss_exp / 2.0)) * cmath.exp(-2j * cmath.pi * float(self.distance) * self.freq / 3e8 * self.model_phase))
 
     def get_g_tag_dbi(self):
         return self.g_tag_dbi
 
     def set_g_tag_dbi(self, g_tag_dbi):
         self.g_tag_dbi = g_tag_dbi
-        self.set_friis_gain((10**((self.g_reader_dbi + self.g_tag_dbi) / 20.0)) * (3e8 / self.freq) / (4.0 * 3.14159265 * max(float(self.distance), 0.05)))
+        self.set_friis_gain((10**((self.g_reader_dbi + self.g_tag_dbi) / 20.0)) * (3e8 / self.freq) / (4.0 * 3.14159265) * (1.0 / max(float(self.distance), 0.05) if float(self.distance) < 1.0 else float(self.distance) ** (-self.path_loss_exp / 2.0)) * cmath.exp(-2j * cmath.pi * float(self.distance) * self.freq / 3e8 * self.model_phase))
+
+    def get_model_phase(self):
+        return self.model_phase
+
+    def set_model_phase(self, model_phase):
+        self.model_phase = model_phase
+        self.set_friis_gain((10**((self.g_reader_dbi + self.g_tag_dbi) / 20.0)) * (3e8 / self.freq) / (4.0 * 3.14159265) * (1.0 / max(float(self.distance), 0.05) if float(self.distance) < 1.0 else float(self.distance) ** (-self.path_loss_exp / 2.0)) * cmath.exp(-2j * cmath.pi * float(self.distance) * self.freq / 3e8 * self.model_phase))
 
     def get_noise_volt_c1(self):
         return self.noise_volt_c1
@@ -121,6 +131,13 @@ class backscatter_channel_1(gr.hier_block2):
     def set_noise_volt_c1(self, noise_volt_c1):
         self.noise_volt_c1 = noise_volt_c1
         self.channels_channel_model_0.set_noise_voltage(self.noise_volt_c1)
+
+    def get_path_loss_exp(self):
+        return self.path_loss_exp
+
+    def set_path_loss_exp(self, path_loss_exp):
+        self.path_loss_exp = path_loss_exp
+        self.set_friis_gain((10**((self.g_reader_dbi + self.g_tag_dbi) / 20.0)) * (3e8 / self.freq) / (4.0 * 3.14159265) * (1.0 / max(float(self.distance), 0.05) if float(self.distance) < 1.0 else float(self.distance) ** (-self.path_loss_exp / 2.0)) * cmath.exp(-2j * cmath.pi * float(self.distance) * self.freq / 3e8 * self.model_phase))
 
     def get_samp_rate_c1(self):
         return self.samp_rate_c1

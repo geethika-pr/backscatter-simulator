@@ -22,7 +22,7 @@ import threading
 
 
 class packet_hex_decoder(gr.hier_block2):
-    def __init__(self, bit_rate=10e3, packet_queue=None, payload_len_bits=16, preamble='10101011', samp_rate=2e6):
+    def __init__(self, accept_inverted=0, bit_rate=10e3, packet_queue=None, payload_len_bits=16, preamble='10101011', samp_rate=2e6):
         gr.hier_block2.__init__(
             self, "Packet Hex Decoder",
                 gr.io_signature(1, 1, gr.sizeof_char*1),
@@ -32,6 +32,7 @@ class packet_hex_decoder(gr.hier_block2):
         ##################################################
         # Parameters
         ##################################################
+        self.accept_inverted = accept_inverted
         self.bit_rate = bit_rate
         self.packet_queue = packet_queue
         self.payload_len_bits = payload_len_bits
@@ -42,7 +43,7 @@ class packet_hex_decoder(gr.hier_block2):
         # Blocks
         ##################################################
 
-        self.epy_block_0 = epy_block_0.packet_hex_decoder(preamble=preamble, payload_len_bits=payload_len_bits, samp_rate=samp_rate, bit_rate=bit_rate, packet_queue=packet_queue)
+        self.epy_block_0 = epy_block_0.packet_hex_decoder(preamble=preamble, payload_len_bits=payload_len_bits, samp_rate=samp_rate, bit_rate=bit_rate, packet_queue=packet_queue, accept_inverted=accept_inverted)
 
 
         ##################################################
@@ -50,6 +51,13 @@ class packet_hex_decoder(gr.hier_block2):
         ##################################################
         self.connect((self, 0), (self.epy_block_0, 0))
 
+
+    def get_accept_inverted(self):
+        return self.accept_inverted
+
+    def set_accept_inverted(self, accept_inverted):
+        self.accept_inverted = accept_inverted
+        self.epy_block_0.accept_inverted = self.accept_inverted
 
     def get_bit_rate(self):
         return self.bit_rate

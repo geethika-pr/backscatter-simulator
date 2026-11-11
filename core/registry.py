@@ -243,6 +243,19 @@ NODE_TYPES = {
             # reported no problem there even before this param existed.
             Param("dc_len", 1024, basic=True, label="DC Blocker Length (samples)"),
             Param("si_isolation_db", 25.0, basic=False, label="SI Isolation (dB)"),
+            # Receiver averaging (Tier-1, 2026-11-11, calibration-plan item 7):
+            # moving average right before the slicer. Off = identical to the old
+            # per-sample decision. Length is normally filled automatically from
+            # the bit rate (NodeItem.avg_len_auto, ui/canvas_window.py).
+            # UI default OFF for now (block default is 1): tested 2026-11-11,
+            # averaging only helps once the decoder samples the middle of the
+            # good timing range; packet_hex_decoder (OOK/BPSK) samples at an
+            # arbitrary point and the FM0/Miller decoders lock on the FIRST
+            # working offset, so with averaging on, results were worse about
+            # half the time. Flip to 1 once the decoders get centre-of-eye
+            # timing (claude/receiver-averaging.md).
+            Param("enable_avg", 0, basic=True, label="Enable Receiver Averaging"),
+            Param("avg_len", 100, basic=False, label="Averaging Length (samples)"),
             Param("samp_rate", 2e6, basic=False, label="Sample Rate"),
         ],
     ),
@@ -271,6 +284,23 @@ NODE_TYPES = {
             # _build_node()).
             Param("dc_len", 1024, basic=True, label="DC Blocker Length (samples)"),
             Param("si_isolation_db", 25.0, basic=False, label="SI Isolation (dB)"),
+            # Costas-loop phase tracking (Tier-1, 2026-11-11, calibration-plan
+            # item 6): rotates the backscatter back onto the real axis before
+            # complex_to_real. Smaller = steadier in noise, slower to lock.
+            Param("loop_bandwidth", 0.002, basic=False, label="Phase-Tracking Loop Bandwidth"),
+            # Receiver averaging (Tier-1, 2026-11-11, calibration-plan item 7):
+            # moving average right before the slicer. Off = identical to the old
+            # per-sample decision. Length is normally filled automatically from
+            # the bit rate (NodeItem.avg_len_auto, ui/canvas_window.py).
+            # UI default OFF for now (block default is 1): tested 2026-11-11,
+            # averaging only helps once the decoder samples the middle of the
+            # good timing range; packet_hex_decoder (OOK/BPSK) samples at an
+            # arbitrary point and the FM0/Miller decoders lock on the FIRST
+            # working offset, so with averaging on, results were worse about
+            # half the time. Flip to 1 once the decoders get centre-of-eye
+            # timing (claude/receiver-averaging.md).
+            Param("enable_avg", 0, basic=True, label="Enable Receiver Averaging"),
+            Param("avg_len", 100, basic=False, label="Averaging Length (samples)"),
             Param("samp_rate", 2e6, basic=False, label="Sample Rate"),
         ],
     ),
@@ -308,6 +338,23 @@ NODE_TYPES = {
             # else, never by position.
             Param("threshold", 0.02, basic=False, label="Slicer Threshold"),
             Param("si_isolation_db", 25.0, basic=False, label="SI Isolation (dB)"),
+            # Costas-loop phase tracking (Tier-1, 2026-11-11, calibration-plan
+            # item 6): rotates the backscatter back onto the real axis before
+            # complex_to_real. Smaller = steadier in noise, slower to lock.
+            Param("loop_bandwidth", 0.002, basic=False, label="Phase-Tracking Loop Bandwidth"),
+            # Receiver averaging (Tier-1, 2026-11-11, calibration-plan item 7):
+            # moving average right before the slicer. Off = identical to the old
+            # per-sample decision. Length is normally filled automatically from
+            # the bit rate (NodeItem.avg_len_auto, ui/canvas_window.py).
+            # UI default OFF for now (block default is 1): tested 2026-11-11,
+            # averaging only helps once the decoder samples the middle of the
+            # good timing range; packet_hex_decoder (OOK/BPSK) samples at an
+            # arbitrary point and the FM0/Miller decoders lock on the FIRST
+            # working offset, so with averaging on, results were worse about
+            # half the time. Flip to 1 once the decoders get centre-of-eye
+            # timing (claude/receiver-averaging.md).
+            Param("enable_avg", 0, basic=True, label="Enable Receiver Averaging"),
+            Param("avg_len", 25, basic=False, label="Averaging Length (samples)"),
             Param("samp_rate", 2e6, basic=False, label="Sample Rate"),
             # The embedded FM0 decoder now re-syncs once per packet instead
             # of trusting a single lock forever (fixes it decoding a later,
@@ -340,6 +387,23 @@ NODE_TYPES = {
             # future experimentation.
             Param("dc_len", 1024, basic=True, label="DC Blocker Length (samples)"),
             Param("si_isolation_db", 25.0, basic=False, label="SI Isolation (dB)"),
+            # Costas-loop phase tracking (Tier-1, 2026-11-11, calibration-plan
+            # item 6): rotates the backscatter back onto the real axis before
+            # complex_to_real. Smaller = steadier in noise, slower to lock.
+            Param("loop_bandwidth", 0.002, basic=False, label="Phase-Tracking Loop Bandwidth"),
+            # Receiver averaging (Tier-1, 2026-11-11, calibration-plan item 7):
+            # moving average right before the slicer. Off = identical to the old
+            # per-sample decision. Length is normally filled automatically from
+            # the bit rate (NodeItem.avg_len_auto, ui/canvas_window.py).
+            # UI default OFF for now (block default is 1): tested 2026-11-11,
+            # averaging only helps once the decoder samples the middle of the
+            # good timing range; packet_hex_decoder (OOK/BPSK) samples at an
+            # arbitrary point and the FM0/Miller decoders lock on the FIRST
+            # working offset, so with averaging on, results were worse about
+            # half the time. Flip to 1 once the decoders get centre-of-eye
+            # timing (claude/receiver-averaging.md).
+            Param("enable_avg", 0, basic=True, label="Enable Receiver Averaging"),
+            Param("avg_len", 12, basic=False, label="Averaging Length (samples)"),
             Param("samp_rate", 2e6, basic=False, label="Sample Rate"),
             # See rx_fm0's own payload_len/preamble comment -- same fix,
             # same reason, same auto-sync from _sync_decoder_params().
@@ -390,12 +454,22 @@ NODE_TYPES = {
             # --- basic: what you'd actually turn while testing ---
             Param("distance", 2, basic=True, label="Distance (m)"),
             Param("fading_type_c1", 0, basic=True, label="Fading Model"),
-            Param("noise_volt_c1", 0.01, basic=True, label="Noise Voltage"),
+            Param("noise_volt_c1", 0.01, basic=True, label="Noise Power"),  # shown in dBm by the UI; stored as noise voltage (core/units.py)
 
             # --- advanced: fixed physical assumptions behind friis_gain ---
             Param("freq", 915e6, basic=False, label="Carrier Frequency"),
             Param("g_reader_dbi", 6.0, basic=False, label="Reader Antenna Gain (dBi)"),
             Param("g_tag_dbi", 2.0, basic=False, label="Tag Antenna Gain (dBi)"),
+            # 2.0 = free space (plain Friis). Measured: ~1.8-2 indoor LOS,
+            # 2.34-2.56 outdoors (Liu et al. 2025). Applies from 1 m on;
+            # below 1 m the block stays free space. calibration-plan item 4.
+            Param("path_loss_exp", 2.0, basic=False, label="Path Loss Exponent"),
+            # 0 = channel gain is a real number (phase never changes with
+            # distance, the old behaviour). 1 = multiply by
+            # exp(-j*2*pi*d*f/c): the real phase rotation, a full turn every
+            # wavelength per hop. BPSK/FM0/Miller receivers need their Costas
+            # phase tracking for this (calibration-plan item 6, stage 2).
+            Param("model_phase", 0, basic=False, label="Model Propagation Phase"),
             Param("samp_rate_c1", 2e6, basic=False, label="Sample Rate"),
         ],
     ),
@@ -461,6 +535,13 @@ NODE_TYPES = {
 
             Param("preamble", "10101011", basic=False, label="Preamble"),
             Param("samp_rate", 2e6, basic=False, label="Sample Rate"),
+            # 1 = also start a packet on the bit-inverted preamble and flip
+            # the payload back (Tier-1, 2026-11-11). Needed for BPSK, whose
+            # Costas loop can lock 180 deg off and invert every bit; FM0/
+            # Miller encode data in transitions, so inversion doesn't hurt
+            # them. Default per receiver type: DECODER_DEFAULTS_BY_RX in
+            # ui/canvas_window.py (on for rx_bpsk, off otherwise).
+            Param("accept_inverted", 0, basic=False, label="Accept Inverted Preamble"),
         ],
         # packet_queue is a live queue.Queue() the middleware/builder hands
         # this node at construction time, not a value anyone types in --

@@ -25,7 +25,7 @@ import threading
 
 
 class backscatter_rx_miller(gr.hier_block2):
-    def __init__(self, bit_rate=10000, dc_len=1024, m=2, payload_len=5, preamble='10101011', samp_rate=2e6, si_enable=1, si_isolation_db=25.0):
+    def __init__(self, avg_len=25, bit_rate=10000, dc_len=1024, enable_avg=1, loop_bandwidth=0.002, m=2, payload_len=5, preamble='10101011', samp_rate=2e6, si_enable=1, si_isolation_db=25.0):
         gr.hier_block2.__init__(
             self, "Reciever Miller (Backscatter)",
                 gr.io_signature.makev(2, 2, [gr.sizeof_gr_complex*1, gr.sizeof_gr_complex*1]),
@@ -35,8 +35,11 @@ class backscatter_rx_miller(gr.hier_block2):
         ##################################################
         # Parameters
         ##################################################
+        self.avg_len = avg_len
         self.bit_rate = bit_rate
         self.dc_len = dc_len
+        self.enable_avg = enable_avg
+        self.loop_bandwidth = loop_bandwidth
         self.m = m
         self.payload_len = payload_len
         self.preamble = preamble
@@ -49,11 +52,13 @@ class backscatter_rx_miller(gr.hier_block2):
         ##################################################
 
         self.epy_block_1 = epy_block_1.miller_decoder(M=m, samp_rate=samp_rate, bit_rate=bit_rate, payload_len_bits=payload_len, preamble=preamble)
+        self.digital_costas_loop_cc_0 = digital.costas_loop_cc(loop_bandwidth, 2, False)
         self.digital_binary_slicer_fb_0 = digital.binary_slicer_fb()
         self.dc_blocker_xx_0 = filter.dc_blocker_cc(dc_len, True)
         self.blocks_selector_0 = blocks.selector(gr.sizeof_gr_complex*1,si_enable,0)
         self.blocks_selector_0.set_enabled(True)
         self.blocks_multiply_const_vxx_0 = blocks.multiply_const_cc(10.0 ** (-si_isolation_db / 20.0))
+        self.blocks_moving_average_xx_0 = blocks.moving_average_ff(avg_len if enable_avg else 1, (1.0 / (avg_len if enable_avg else 1)), 4000, 1)
         self.blocks_complex_to_real_0 = blocks.complex_to_real(1)
         self.blocks_add_xx_0 = blocks.add_vcc(1)
 
@@ -62,16 +67,25 @@ class backscatter_rx_miller(gr.hier_block2):
         # Connections
         ##################################################
         self.connect((self.blocks_add_xx_0, 0), (self.blocks_selector_0, 1))
-        self.connect((self.blocks_complex_to_real_0, 0), (self.digital_binary_slicer_fb_0, 0))
+        self.connect((self.blocks_complex_to_real_0, 0), (self.blocks_moving_average_xx_0, 0))
+        self.connect((self.blocks_moving_average_xx_0, 0), (self.digital_binary_slicer_fb_0, 0))
         self.connect((self.blocks_multiply_const_vxx_0, 0), (self.blocks_add_xx_0, 1))
         self.connect((self.blocks_selector_0, 0), (self.dc_blocker_xx_0, 0))
-        self.connect((self.dc_blocker_xx_0, 0), (self.blocks_complex_to_real_0, 0))
+        self.connect((self.dc_blocker_xx_0, 0), (self.digital_costas_loop_cc_0, 0))
         self.connect((self.digital_binary_slicer_fb_0, 0), (self.epy_block_1, 0))
+        self.connect((self.digital_costas_loop_cc_0, 0), (self.blocks_complex_to_real_0, 0))
         self.connect((self.epy_block_1, 0), (self, 0))
         self.connect((self, 0), (self.blocks_add_xx_0, 0))
         self.connect((self, 0), (self.blocks_selector_0, 0))
         self.connect((self, 1), (self.blocks_multiply_const_vxx_0, 0))
 
+
+    def get_avg_len(self):
+        return self.avg_len
+
+    def set_avg_len(self, avg_len):
+        self.avg_len = avg_len
+        self.blocks_moving_average_xx_0.set_length_and_scale(self.avg_len if self.enable_avg else 1, (1.0 / (self.avg_len if self.enable_avg else 1)))
 
     def get_bit_rate(self):
         return self.bit_rate
@@ -84,6 +98,20 @@ class backscatter_rx_miller(gr.hier_block2):
 
     def set_dc_len(self, dc_len):
         self.dc_len = dc_len
+
+    def get_enable_avg(self):
+        return self.enable_avg
+
+    def set_enable_avg(self, enable_avg):
+        self.enable_avg = enable_avg
+        self.blocks_moving_average_xx_0.set_length_and_scale(self.avg_len if self.enable_avg else 1, (1.0 / (self.avg_len if self.enable_avg else 1)))
+
+    def get_loop_bandwidth(self):
+        return self.loop_bandwidth
+
+    def set_loop_bandwidth(self, loop_bandwidth):
+        self.loop_bandwidth = loop_bandwidth
+        self.digital_costas_loop_cc_0.set_loop_bandwidth(self.loop_bandwidth)
 
     def get_m(self):
         return self.m
