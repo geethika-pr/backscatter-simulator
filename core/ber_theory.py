@@ -108,12 +108,19 @@ def ber_ook_envelope(e_db, off_ratio=0.0):
     nu0 = nu1 * off_ratio
     sigma = 1.0 / math.sqrt(e)          # total complex noise std (a = 1)
     s = sigma / math.sqrt(2.0)          # per I/Q part
-    top = nu1 + 14.0 * s + 1.0
-    mean0 = _integrate(lambda r: r * _rice_pdf(r, nu0, s), 0.0, nu0 + 14.0 * s + 1.0)
-    mean1 = _integrate(lambda r: r * _rice_pdf(r, nu1, s), 0.0, top)
+    # Integrate only where each Rician pdf actually lives (+-16 s around its
+    # level, padded by 1 at low SNR where the pdf is wide and skewed). A
+    # fixed 0..level+1 grid misses the pdf entirely once s is tiny (very
+    # high SNR, e.g. ~80 dB with realistic defaults) and returned garbage
+    # (0.5-0.9) instead of ~0. Same results as before up to ~60 dB.
+    pad = 16.0 * s + (1.0 if s > 0.1 else 0.0)
+    lo0, hi0 = max(0.0, nu0 - pad), nu0 + pad
+    lo1, hi1 = max(0.0, nu1 - pad), nu1 + pad
+    mean0 = _integrate(lambda r: r * _rice_pdf(r, nu0, s), lo0, hi0)
+    mean1 = _integrate(lambda r: r * _rice_pdf(r, nu1, s), lo1, hi1)
     thr = 0.5 * (mean0 + mean1)
-    p_off_wrong = _integrate(lambda r: _rice_pdf(r, nu0, s), thr, max(thr, nu0) + 16.0 * s + 1.0)
-    p_on_wrong = _integrate(lambda r: _rice_pdf(r, nu1, s), 0.0, thr)
+    p_off_wrong = _integrate(lambda r: _rice_pdf(r, nu0, s), max(thr, lo0), hi0)
+    p_on_wrong = _integrate(lambda r: _rice_pdf(r, nu1, s), lo1, min(thr, hi1))
     return max(0.0, 0.5 * (p_off_wrong + p_on_wrong))
 
 

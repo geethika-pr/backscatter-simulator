@@ -48,7 +48,7 @@ PREAMBLE_BITS = [int(b) for b in PREAMBLE]
 # registry default (packet_bits=16, too short to ever be caught).
 DEFAULT_TAG_OVERRIDES = {
     "packet_bits": 10000,
-    "p_th": 0.5,
+    "p_th": 3.16e-5,   # -15 dBm, passive UHF tag chip (was 0.5 W = +27 dBm). 2026-11-16
 }
 
 # si_isolation_db is tuned per-modulation DETECTOR TYPE: OOK's envelope
@@ -56,7 +56,10 @@ DEFAULT_TAG_OVERRIDES = {
 # FM0/Miller) are fine at ~25dB since their DC blocker removes constant
 # residual exactly. ui/main_window.py imports this same dict so the two
 # can't drift apart.
-SI_ISOLATION_DEFAULTS = {"OOK": 100.0, "BPSK": 25.0, "FM0": 25.0, "Miller": 25.0}
+# 2026-11-16: 40 dB for every modulation (was OOK 100 = effectively no
+# leak, others 25). Real readers: ~17 dB plain circulator (Wang 2020),
+# >30 dB with a good antenna (Ryu 2026), more with active cancellation.
+SI_ISOLATION_DEFAULTS = {"OOK": 30.0, "BPSK": 30.0, "FM0": 30.0, "Miller": 30.0}  # 2026-11-16: 30 dB (tested at realistic levels, all four decode)
 
 # rx_fm0/rx_miller already decimate Data_Out to one sample/bit internally,
 # unlike rx_ook/rx_bpsk (full sample rate). Building their decoder at
@@ -246,7 +249,7 @@ class BackscatterMiddleware:
         specs, not hardcoded.
 
     distance: moves the RETURN channel only, live. Forward channel is
-        fixed at distance=1/noise=0.02.
+        fixed at distance=1/noise=2e-7 (-104 dBm).
 
     si_isolation_db: detector-type dependent, not a tuning nicety --
         OOK needs ~100dB, phase-based schemes (BPSK/FM0/Miller) are fine
@@ -257,7 +260,7 @@ class BackscatterMiddleware:
         samp_rate) auto-syncs to the rx.
     """
 
-    def __init__(self, modulation, tag_specs, distance=1, si_isolation_db=100.0,
+    def __init__(self, modulation, tag_specs, distance=1, si_isolation_db=30.0,
                  extra_tag_overrides=None):
         if modulation not in registry.MODULATION_MAP:
             raise ValueError(
@@ -304,12 +307,12 @@ class BackscatterMiddleware:
 
         sender = backscatter_sender(
             carrier_freq_send=0, command_bits=(0, 1, 0, 1), enable_gated=1,
-            phase_noise_std_send=0, samp_rate_send=SAMP_RATE, tari=12.5, tx_power_send=20,
+            phase_noise_std_send=0, samp_rate_send=SAMP_RATE, tari=12.5, tx_power_send=1.0,
         )
         throttle = blocks.throttle(gr.sizeof_gr_complex, SAMP_RATE, True)
         fwd_channel = backscatter_channel_1(
             distance=1, fading_type_c1=0, freq=915e6,          # fixed, matching working canvas
-            g_reader_dbi=6.0, g_tag_dbi=2.0, noise_volt_c1=0.02, samp_rate_c1=SAMP_RATE,
+            g_reader_dbi=6.0, g_tag_dbi=2.0, noise_volt_c1=2.0e-7, samp_rate_c1=SAMP_RATE,
         )
         zero_source_a = blocks.vector_source_c([0j], True)
         self.tb.connect((sender, 0), (throttle, 0))
@@ -338,7 +341,7 @@ class BackscatterMiddleware:
         zero_source_b = blocks.vector_source_c([0j], True)
         ret_channel = backscatter_channel_1(
             distance=distance, fading_type_c1=0, freq=915e6,   # live-adjustable, matching working canvas default
-            g_reader_dbi=6.0, g_tag_dbi=2.0, noise_volt_c1=0.01, samp_rate_c1=SAMP_RATE,
+            g_reader_dbi=6.0, g_tag_dbi=2.0, noise_volt_c1=2.0e-7, samp_rate_c1=SAMP_RATE,
         )
         self.tb.connect((adder, 0), (ret_channel, 0))
         self.tb.connect((zero_source_b, 0), (ret_channel, 1))
@@ -618,7 +621,7 @@ def build_fixed_topology(modulation, tag_specs, sender_params=None,
         default (0), which outputs an un-PIE-modulated carrier and gives
         tags no slot timing at all.
 
-    fwd_channel_params: defaults to {"distance": 1, "noise_volt_c1": 0.02}
+    fwd_channel_params: defaults to {"distance": 1, "noise_volt_c1": 2.0e-7}
         -- BackscatterMiddleware's validated forward-channel values (the
         registry's plain defaults are actually the RETURN channel's).
 
@@ -672,7 +675,7 @@ def build_fixed_topology(modulation, tag_specs, sender_params=None,
     # it's not part of the tag->rx sync above -- baked in as a default
     # here instead, same way enable_gated/noise_volt_c1 are baked in for
     # sender/fwd_channel, and just as overridable via rx_params.
-    rx_overrides["si_isolation_db"] = SI_ISOLATION_DEFAULTS.get(modulation, 25.0)
+    rx_overrides["si_isolation_db"] = SI_ISOLATION_DEFAULTS.get(modulation, 30.0)
     if rx_params:
         rx_overrides.update(rx_params)
 
@@ -688,7 +691,7 @@ def build_fixed_topology(modulation, tag_specs, sender_params=None,
     if sender_params:
         sender_overrides.update(sender_params)
 
-    fwd_channel_overrides = {"distance": 1, "noise_volt_c1": 0.02}
+    fwd_channel_overrides = {"distance": 1, "noise_volt_c1": 2.0e-7}
     if fwd_channel_params:
         fwd_channel_overrides.update(fwd_channel_params)
 

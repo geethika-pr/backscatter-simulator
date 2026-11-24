@@ -45,7 +45,6 @@ def get_state_directory() -> str:
 sys.path.append(os.environ.get('GRC_HIER_PATH', get_state_directory()))
 
 from complex_gamma_modulator import complex_gamma_modulator  # grc-generated hier_block
-from gnuradio import blocks
 from gnuradio import gr
 from gnuradio.filter import firdes
 from gnuradio.fft import window
@@ -53,6 +52,7 @@ import signal
 from harvesting_gate import harvesting_gate  # grc-generated hier_block
 from tag_pie_decoder import tag_pie_decoder  # grc-generated hier_block
 import backscatter_tag_fm0_epy_block_0 as epy_block_0  # embedded python block
+import backscatter_tag_fm0_epy_block_1 as epy_block_1  # embedded python block
 import threading
 
 
@@ -62,7 +62,7 @@ import threading
 
 
 class backscatter_tag_fm0(gr.hier_block2):
-    def __init__(self, alpha=0.01, as_imag=0.02, as_real=0.05, bit_rate=10e3, enable_gated=1, gamma0_mag=0.2, gamma0_phase_deg=15.0, gamma1_mag=0.85, gamma1_phase_deg=160.0, p_th=0.001, packet_bits=16, pie_bits='0,1,0,1', samp_rate=2e6, slot_id=0):
+    def __init__(self, alpha=0.01, as_imag=0.02, as_real=0.05, bit_rate=10e3, enable_gated=1, gamma0_mag=0.2, gamma0_phase_deg=15.0, gamma1_mag=0.85, gamma1_phase_deg=160.0, p_th=0.001, packet_bits=16, pie_bits='0,1,0,1', samp_rate=2e6, slot_id=0, tari=12.5):
         gr.hier_block2.__init__(
             self, "Tag_FM0 (Backscatter)",
                 gr.io_signature.makev(2, 2, [gr.sizeof_gr_complex*1, gr.sizeof_char*1]),
@@ -86,25 +86,27 @@ class backscatter_tag_fm0(gr.hier_block2):
         self.pie_bits = pie_bits
         self.samp_rate = samp_rate
         self.slot_id = slot_id
+        self.tari = tari
 
         ##################################################
         # Blocks
         ##################################################
 
         self.tag_pie_decoder_0 = tag_pie_decoder(
-            bit_rate=10e3,
+            bit_rate=bit_rate,
             enable_mac=enable_gated,
             packet_bits=packet_bits,
             pie_bits=pie_bits,
             samp_rate=samp_rate,
             slot_id=slot_id,
-            tari=12.5,
+            tari=tari,
             threshold=0.6,
         )
         self.harvesting_gate_0 = harvesting_gate(
             alpha=alpha,
             p_th=p_th,
         )
+        self.epy_block_1 = epy_block_1.burst_player(interp=int((samp_rate / bit_rate) / 2), sym_per_bit=2, lead_in_bits=0)
         self.epy_block_0 = epy_block_0.blk(dummy_param=1.0)
         self.complex_gamma_modulator_0 = complex_gamma_modulator(
             as_imag=as_imag,
@@ -116,23 +118,20 @@ class backscatter_tag_fm0(gr.hier_block2):
             gamma1_phase_deg=gamma1_phase_deg,
             jitter_samples=0.0,
         )
-        self.blocks_repeat_0 = blocks.repeat(gr.sizeof_float*1, (int((samp_rate / bit_rate) / 2)))
-        self.blocks_multiply_xx_0 = blocks.multiply_vff(1)
 
 
         ##################################################
         # Connections
         ##################################################
-        self.connect((self.blocks_multiply_xx_0, 0), (self.harvesting_gate_0, 1))
-        self.connect((self.blocks_repeat_0, 0), (self.blocks_multiply_xx_0, 1))
         self.connect((self.complex_gamma_modulator_0, 0), (self, 0))
-        self.connect((self.epy_block_0, 0), (self.blocks_repeat_0, 0))
+        self.connect((self.epy_block_0, 0), (self.epy_block_1, 0))
+        self.connect((self.epy_block_1, 0), (self.harvesting_gate_0, 1))
         self.connect((self.harvesting_gate_0, 0), (self.complex_gamma_modulator_0, 1))
         self.connect((self, 0), (self.complex_gamma_modulator_0, 0))
         self.connect((self, 0), (self.harvesting_gate_0, 0))
         self.connect((self, 0), (self.tag_pie_decoder_0, 0))
         self.connect((self, 1), (self.epy_block_0, 0))
-        self.connect((self.tag_pie_decoder_0, 0), (self.blocks_multiply_xx_0, 0))
+        self.connect((self.tag_pie_decoder_0, 0), (self.epy_block_1, 1))
 
 
     def get_alpha(self):
@@ -161,7 +160,8 @@ class backscatter_tag_fm0(gr.hier_block2):
 
     def set_bit_rate(self, bit_rate):
         self.bit_rate = bit_rate
-        self.blocks_repeat_0.set_interpolation((int((self.samp_rate / self.bit_rate) / 2)))
+        self.epy_block_1.interp = int((self.samp_rate / self.bit_rate) / 2)
+        self.tag_pie_decoder_0.set_bit_rate(self.bit_rate)
 
     def get_enable_gated(self):
         return self.enable_gated
@@ -224,7 +224,7 @@ class backscatter_tag_fm0(gr.hier_block2):
 
     def set_samp_rate(self, samp_rate):
         self.samp_rate = samp_rate
-        self.blocks_repeat_0.set_interpolation((int((self.samp_rate / self.bit_rate) / 2)))
+        self.epy_block_1.interp = int((self.samp_rate / self.bit_rate) / 2)
         self.tag_pie_decoder_0.set_samp_rate(self.samp_rate)
 
     def get_slot_id(self):
@@ -233,4 +233,11 @@ class backscatter_tag_fm0(gr.hier_block2):
     def set_slot_id(self, slot_id):
         self.slot_id = slot_id
         self.tag_pie_decoder_0.set_slot_id(self.slot_id)
+
+    def get_tari(self):
+        return self.tari
+
+    def set_tari(self, tari):
+        self.tari = tari
+        self.tag_pie_decoder_0.set_tari(self.tari)
 

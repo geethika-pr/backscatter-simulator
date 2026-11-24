@@ -24,7 +24,7 @@ import threading
 
 
 class backscatter_channel_1(gr.hier_block2):
-    def __init__(self, distance=2, fading_type_c1=0, freq=915e6, g_reader_dbi=6.0, g_tag_dbi=2.0, model_phase=0, noise_volt_c1=0.01, path_loss_exp=2.0, samp_rate_c1=2e6):
+    def __init__(self, distance=2, doppler_hz=10.0, fade_seed=2, fading_type_c1=0, freq=915e6, g_reader_dbi=6.0, g_tag_dbi=2.0, model_phase=0, noise_volt_c1=0.01, path_loss_exp=2.0, rician_k=10.0, samp_rate_c1=2e6):
         gr.hier_block2.__init__(
             self, "Channel",
                 gr.io_signature.makev(2, 2, [gr.sizeof_gr_complex*1, gr.sizeof_gr_complex*1]),
@@ -35,6 +35,8 @@ class backscatter_channel_1(gr.hier_block2):
         # Parameters
         ##################################################
         self.distance = distance
+        self.doppler_hz = doppler_hz
+        self.fade_seed = fade_seed
         self.fading_type_c1 = fading_type_c1
         self.freq = freq
         self.g_reader_dbi = g_reader_dbi
@@ -42,6 +44,7 @@ class backscatter_channel_1(gr.hier_block2):
         self.model_phase = model_phase
         self.noise_volt_c1 = noise_volt_c1
         self.path_loss_exp = path_loss_exp
+        self.rician_k = rician_k
         self.samp_rate_c1 = samp_rate_c1
 
         ##################################################
@@ -53,8 +56,8 @@ class backscatter_channel_1(gr.hier_block2):
         # Blocks
         ##################################################
 
-        self.channels_fading_model_0_0 = channels.fading_model( 8, (10.0/samp_rate_c1), False, 10.0, 0 )
-        self.channels_fading_model_0 = channels.fading_model( 8, (10.0/samp_rate_c1), True, 10.0, 0 )
+        self.channels_fading_model_0_0 = channels.fading_model( 8, (doppler_hz/samp_rate_c1), False, 10.0, fade_seed )
+        self.channels_fading_model_0 = channels.fading_model( 8, (doppler_hz/samp_rate_c1), True, rician_k, fade_seed )
         self.channels_channel_model_0 = channels.channel_model(
             noise_voltage=noise_volt_c1,
             frequency_offset=0.0,
@@ -89,6 +92,20 @@ class backscatter_channel_1(gr.hier_block2):
     def set_distance(self, distance):
         self.distance = distance
         self.set_friis_gain((10**((self.g_reader_dbi + self.g_tag_dbi) / 20.0)) * (3e8 / self.freq) / (4.0 * 3.14159265) * (1.0 / max(float(self.distance), 0.05) if float(self.distance) < 1.0 else float(self.distance) ** (-self.path_loss_exp / 2.0)) * cmath.exp(-2j * cmath.pi * float(self.distance) * self.freq / 3e8 * self.model_phase))
+
+    def get_doppler_hz(self):
+        return self.doppler_hz
+
+    def set_doppler_hz(self, doppler_hz):
+        self.doppler_hz = doppler_hz
+        self.channels_fading_model_0.set_fDTs((self.doppler_hz/self.samp_rate_c1))
+        self.channels_fading_model_0_0.set_fDTs((self.doppler_hz/self.samp_rate_c1))
+
+    def get_fade_seed(self):
+        return self.fade_seed
+
+    def set_fade_seed(self, fade_seed):
+        self.fade_seed = fade_seed
 
     def get_fading_type_c1(self):
         return self.fading_type_c1
@@ -139,13 +156,20 @@ class backscatter_channel_1(gr.hier_block2):
         self.path_loss_exp = path_loss_exp
         self.set_friis_gain((10**((self.g_reader_dbi + self.g_tag_dbi) / 20.0)) * (3e8 / self.freq) / (4.0 * 3.14159265) * (1.0 / max(float(self.distance), 0.05) if float(self.distance) < 1.0 else float(self.distance) ** (-self.path_loss_exp / 2.0)) * cmath.exp(-2j * cmath.pi * float(self.distance) * self.freq / 3e8 * self.model_phase))
 
+    def get_rician_k(self):
+        return self.rician_k
+
+    def set_rician_k(self, rician_k):
+        self.rician_k = rician_k
+        self.channels_fading_model_0.set_K(self.rician_k)
+
     def get_samp_rate_c1(self):
         return self.samp_rate_c1
 
     def set_samp_rate_c1(self, samp_rate_c1):
         self.samp_rate_c1 = samp_rate_c1
-        self.channels_fading_model_0.set_fDTs((10.0/self.samp_rate_c1))
-        self.channels_fading_model_0_0.set_fDTs((10.0/self.samp_rate_c1))
+        self.channels_fading_model_0.set_fDTs((self.doppler_hz/self.samp_rate_c1))
+        self.channels_fading_model_0_0.set_fDTs((self.doppler_hz/self.samp_rate_c1))
 
     def get_friis_gain(self):
         return self.friis_gain

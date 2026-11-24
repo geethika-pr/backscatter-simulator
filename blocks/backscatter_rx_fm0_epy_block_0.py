@@ -16,7 +16,8 @@ class blk(gr.basic_block):
             self, name='FM0 Decoder (synced)',
             in_sig=[np.uint8], out_sig=[np.uint8],
         )
-        self.buf = []
+        self._empty = np.zeros(0, np.uint8)
+        self.buf = self._empty
         self.prev_sample = None
         self.same_run = 0
         self.dead_run_threshold = 3 * self.sps
@@ -24,7 +25,7 @@ class blk(gr.basic_block):
 
         self.locked = False
         self.phase_offset = 0
-        self.locked_buf = []
+        self.locked_buf = self._empty
         self.bits_emitted = 0  # since the current lock was acquired
 
     def _decode_bit(self, window):
@@ -33,72 +34,178 @@ class blk(gr.basic_block):
         return 1 if window[idx1] == window[idx2] else 0
 
     def _try_lock(self):
-        needed = self.sps * len(self.preamble_bits)
-        for offset in range(self.sps):
-            if offset + needed > len(self.buf):
-                break
-            bits = [self._decode_bit(self.buf[offset + k * self.sps: offset + (k + 1) * self.sps])
-                    for k in range(len(self.preamble_bits))]
-            if bits == self.preamble_bits:
-                self.phase_offset = offset
-                return True
-        return False
+        # Centre-of-eye lock: test EVERY offset, then take the middle of the
+        # first contiguous run of offsets that decode the preamble, instead
+        # of the first offset that happens to work (which sits at the edge
+        # of the good region and becomes fragile once edges are smeared,
+        # e.g. by receiver averaging). All offsets are tested at once with
+        # numpy (same rule as _decode_bit, same answer as the old loop).
+        P = len(self.preamble_bits)
+        needed = self.sps * P
+        noff = min(self.sps, len(self.buf) - needed + 1)
+        if noff <= 0:
+            return False
+        i1 = int(self.sps * 0.25)
+        i2 = int(self.sps * 0.75)
+        ok = np.ones(noff, bool)
+        for k in range(P):
+            a = k * self.sps
+            bit = self.buf[a + i1:a + i1 + noff] == self.buf[a + i2:a + i2 + noff]
+            ok &= bit == bool(self.preamble_bits[k])
+        hits = np.flatnonzero(ok)
+        if len(hits) == 0:
+            return False
+        first = int(hits[0])
+        miss = np.flatnonzero(~ok[first:])
+        run = int(miss[0]) if len(miss) else noff - first
+        self.phase_offset = first + run // 2
+        return True
 
     def _unlock(self):
         self.active = False
         self.locked = False
-        self.buf = []
-        self.locked_buf = []
+        self.buf = self._empty
+        self.locked_buf = self._empty
         self.bits_emitted = 0
 
     def general_work(self, input_items, output_items):
-        in_data = input_items[0]
+        # Speed revision (2026-11-12): same state machine as before (one
+        # sample at a time: dead-run reset, activation, lock attempt every
+        # time the search buffer is full, one bit per sps samples once
+        # locked), but instead of a Python step for EVERY sample it jumps
+        # straight to the next sample where something happens. Output is
+        # identical to the per-sample version; CPU use drops ~10-50x.
+        x = np.asarray(input_items[0], dtype=np.uint8)
         out_data = output_items[0]
+        n = len(x)
         n_produced = 0
+        sps = self.sps
+        D = self.dead_run_threshold
+        needed = sps * (len(self.preamble_bits) + 1)
+        i1 = int(sps * 0.25)
+        i2 = int(sps * 0.75)
+        if n == 0:
+            self.consume(0, 0)
+            return 0
 
-        for sample in in_data:
-            if self.prev_sample is not None and sample == self.prev_sample:
-                self.same_run += 1
-            else:
-                self.same_run = 0
-            self.prev_sample = sample
+        # same_run for every sample (run length of equal consecutive values)
+        idx = np.arange(n)
+        if self.prev_sample is None:
+            eq = np.concatenate([[False], x[1:] == x[:-1]])
+        else:
+            eq = np.concatenate([[x[0] == self.prev_sample], x[1:] == x[:-1]])
+        last_reset = np.maximum.accumulate(np.where(~eq, idx, -1))
+        sr = np.where(last_reset >= 0, idx - last_reset, self.same_run + idx + 1)
+        dead = sr >= D
+        dead_pos = np.flatnonzero(dead)
+        live_pos = np.flatnonzero(~dead)
+        act_pos = np.flatnonzero(sr == 0)
 
-            if self.same_run >= self.dead_run_threshold:
-                self._unlock()
+        def next_in(pos, i):
+            k = np.searchsorted(pos, i)
+            return int(pos[k]) if k < len(pos) else n
 
-            if not self.locked:
-                self.buf.append(sample)
-                if not self.active and self.same_run == 0:
-                    self.active = True
-                if self.active:
-                    needed = self.sps * (len(self.preamble_bits) + 1)
-                    if len(self.buf) >= needed:
-                        if self._try_lock():
-                            self.locked = True
-                            self.locked_buf = self.buf[self.phase_offset:]
-                            self.buf = []
-                            self.bits_emitted = 0
-                        else:
-                            self.buf = self.buf[self.sps:]
+        i = 0
+        while i < n:
+            if not self.locked and not self.active:
+                if dead[i]:
+                    # every dead sample unlocks and leaves buf = [that sample]
+                    k = next_in(live_pos, i)
+                    self._unlock()
+                    self.buf = x[k - 1:k].copy()
+                    i = k
+                    continue
+                j = min(next_in(dead_pos, i), next_in(act_pos, i))
+                if j > i:
+                    self.buf = np.concatenate([self.buf, x[i:j]])
+                    i = j
+                    continue
+                # j == i: activation sample (same_run == 0, not dead)
+                self.buf = np.concatenate([self.buf, x[i:i + 1]])
+                self.active = True
+                self._after_append_unlocked()
+                i += 1
                 continue
 
-            self.locked_buf.append(sample)
-            if len(self.locked_buf) >= self.sps:
-                window = self.locked_buf[:self.sps]
-                if n_produced < len(out_data):
-                    out_data[n_produced] = self._decode_bit(window)
-                    n_produced += 1
-                self.locked_buf = self.locked_buf[self.sps:]
-                self.bits_emitted += 1
-
-                if self.bits_emitted >= self.packet_len_bits:
-                    # Full packet decoded at this lock -- force a fresh
-                    # search before the next bit, so a different tag's
-                    # later burst can never ride on this stale phase.
+            if not self.locked:          # active, searching
+                jd = next_in(dead_pos, i)
+                jn = i + max(0, needed - len(self.buf) - 1)
+                j = min(jd, jn)
+                if j >= n:
+                    self.buf = np.concatenate([self.buf, x[i:n]])
+                    i = n
+                    continue
+                if j > i:
+                    self.buf = np.concatenate([self.buf, x[i:j]])
+                    i = j
+                if dead[i]:
                     self._unlock()
+                    self.buf = x[i:i + 1].copy()
+                else:
+                    self.buf = np.concatenate([self.buf, x[i:i + 1]])
+                    self._after_append_unlocked()
+                i += 1
+                continue
 
+            # locked
+            if len(out_data) == 0:
+                # (degenerate: no room at all) process one sample, then stop
+                if dead[i]:
+                    self._unlock()
+                    self.buf = x[i:i + 1].copy()
+                    i += 1
+                    continue
+                self.locked_buf = np.concatenate([self.locked_buf, x[i:i + 1]])
+                if len(self.locked_buf) >= sps:
+                    self.locked_buf = self.locked_buf[sps:]
+                    self.bits_emitted += 1
+                    if self.bits_emitted >= self.packet_len_bits:
+                        self._unlock()
+                i += 1
+                break
+            jd = next_in(dead_pos, i)
+            je = i + max(0, sps - 1 - len(self.locked_buf))
+            j = min(jd, je)
+            if j >= n:
+                self.locked_buf = np.concatenate([self.locked_buf, x[i:n]])
+                i = n
+                continue
+            if j > i:
+                self.locked_buf = np.concatenate([self.locked_buf, x[i:j]])
+                i = j
+            if dead[i]:
+                self._unlock()
+                self.buf = x[i:i + 1].copy()
+                i += 1
+                continue
+            self.locked_buf = np.concatenate([self.locked_buf, x[i:i + 1]])
+            window = self.locked_buf[:sps]
+            out_data[n_produced] = 1 if window[i1] == window[i2] else 0
+            n_produced += 1
+            self.locked_buf = self.locked_buf[sps:]
+            self.bits_emitted += 1
+            if self.bits_emitted >= self.packet_len_bits:
+                # Full packet decoded at this lock -- force a fresh
+                # search before the next bit, so a different tag's
+                # later burst can never ride on this stale phase.
+                self._unlock()
+            i += 1
             if n_produced >= len(out_data):
                 break
 
-        self.consume(0, len(in_data))
+        # carry per-sample run state to the next call (up to where we stopped)
+        self.prev_sample = x[i - 1]
+        self.same_run = int(sr[i - 1])
+        self.consume(0, n)
         return n_produced
+
+    def _after_append_unlocked(self):
+        # the old per-sample code's "buffer full -> try to lock" step
+        if len(self.buf) >= self.sps * (len(self.preamble_bits) + 1):
+            if self._try_lock():
+                self.locked = True
+                self.locked_buf = self.buf[self.phase_offset:]
+                self.buf = self._empty
+                self.bits_emitted = 0
+            else:
+                self.buf = self.buf[self.sps:]

@@ -22,8 +22,6 @@ class miller_decoder(gr.basic_block):
         self.locked = False
         self.bits_emitted = 0
         self._printed_lock = False
-        self._dump_done = False
-        self._dump_buf = []
 
     def _decode_bit(self, chunk):
         # Tolerant decode, used once locked -- deliberately loose about
@@ -70,28 +68,61 @@ class miller_decoder(gr.basic_block):
             bits.append(bit)
         return bits
 
+    def _strict_bits_all(self):
+        # _decode_bit_strict for the bit window starting at EVERY sample of
+        # buf at once (numpy), instead of one window at a time in Python.
+        # Same rule, same answers: 0 = alternates at every boundary, 1 =
+        # alternates everywhere except the exact middle boundary, -1 = not
+        # a valid Miller bit shape.
+        n = len(self.buf) - self.sps + 1
+        if n <= 0:
+            return np.zeros(0, np.int8)
+        idx = [j * self.seg + self.seg // 2 for j in range(2 * self.M)]
+        cols = [self.buf[i:i + n] for i in idx]
+        diffs = [cols[i] != cols[i + 1] for i in range(len(cols) - 1)]
+        n_trans = np.sum(diffs, axis=0)
+        bit0 = n_trans == len(diffs)
+        bit1 = (n_trans == len(diffs) - 1) & ~diffs[self.M - 1]
+        return np.where(bit0, 0, np.where(bit1, 1, -1)).astype(np.int8)
+
     def _search_for_lock(self):
-        needed = self.sps * (self.preamble_len + 1)
-        while len(self.buf) >= needed:
-            for phase in range(self.sps):
-                if phase + self.sps * self.preamble_len > len(self.buf):
-                    break
-                if self._decode_bits_at_strict(phase, self.preamble_len) == self.preamble_bits:
-                    return phase
-            self.buf = self.buf[self.sps:]
-        return None
+        # Centre-of-eye lock: collect the first contiguous run of phases that
+        # decode the preamble and return its MIDDLE, instead of the first
+        # phase that works (the edge of the good region -- fragile once the
+        # signal's edges are smeared, e.g. by receiver averaging).
+        #
+        # Speed revision (2026-11-12): same search, same result, but every
+        # candidate start is checked at once with numpy. The old version
+        # looped in Python one phase at a time and needed ~3-5 s of CPU per
+        # second of signal, which froze the UI. The search still goes one
+        # bit-wide block of phases at a time: the first block that holds a
+        # match wins, and the run of matches is cut at that block's end,
+        # exactly as before.
+        sps, P = self.sps, self.preamble_len
+        needed = sps * (P + 1)
+        if len(self.buf) < needed:
+            return None
+        nblocks = (len(self.buf) - needed) // sps + 1
+        S = nblocks * sps                       # candidate start phases 0..S-1
+        strict = self._strict_bits_all()
+        m = np.ones(S, bool)
+        for k in range(P):
+            m &= strict[k * sps:k * sps + S] == self.preamble_bits[k]
+        hits = np.flatnonzero(m)
+        if len(hits) == 0:
+            self.buf = self.buf[S:]
+            return None
+        b = int(hits[0]) // sps
+        block = m[b * sps:(b + 1) * sps]
+        first = int(hits[0]) - b * sps
+        miss = np.flatnonzero(~block[first:])
+        run = int(miss[0]) if len(miss) else sps - first
+        self.buf = self.buf[b * sps:]
+        return first + run // 2
 
     def general_work(self, input_items, output_items):
         in_data = input_items[0]
         out = output_items[0]
-
-        if not self._dump_done:
-            self._dump_buf.extend(in_data.tolist())
-            if len(self._dump_buf) >= 4000:
-                with open("miller_raw_dump.txt", "w") as f:
-                    f.write(",".join(str(x) for x in self._dump_buf[:4000]))
-                print("[Miller Decoder] raw dump written", flush=True)
-                self._dump_done = True
 
         self.buf = np.concatenate([self.buf, in_data])
         self.consume(0, len(in_data))

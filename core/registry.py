@@ -81,7 +81,12 @@ NODE_TYPES = {
 
             # --- advanced: physical/RF tuning, hidden by default ---
             Param("pie_bits", "0,1,0,1", basic=False, label="Expected Command Bits"),
-            Param("p_th", 0.001, basic=False, label="Harvesting Threshold"),
+            # Tari of the reader command, which this tag's command detector
+            # must know to read it. NOT typed by hand: copied from the tag's
+            # sender at every Start (CanvasWindow._sync_tag_tari_from_senders),
+            # so it always matches. Was hard-coded 12.5 in every tag block.
+            Param("tari", 12.5, basic=False, label="Tari (from sender, µs)"),
+            Param("p_th", 3.16e-5, basic=False, label="Harvesting Threshold"),  # -15 dBm: passive UHF chip (was 0 dBm)
             Param("alpha", 0.01, basic=False, label="Alpha Factor"),
             Param("as_real", 0.05, basic=False, label="Structural Scattering (Real)"),
             Param("as_imag", 0.0, basic=False, label="Structural Scattering (Imag)"),
@@ -110,7 +115,12 @@ NODE_TYPES = {
             Param("enable_gated", 1, basic=False, label="Gated Mode"),
 
             Param("pie_bits", "0,1,0,1", basic=False, label="Expected Command Bits"),
-            Param("p_th", 0.001, basic=False, label="Harvesting Threshold"),
+            # Tari of the reader command, which this tag's command detector
+            # must know to read it. NOT typed by hand: copied from the tag's
+            # sender at every Start (CanvasWindow._sync_tag_tari_from_senders),
+            # so it always matches. Was hard-coded 12.5 in every tag block.
+            Param("tari", 12.5, basic=False, label="Tari (from sender, µs)"),
+            Param("p_th", 3.16e-5, basic=False, label="Harvesting Threshold"),  # -15 dBm: passive UHF chip (was 0 dBm)
             Param("alpha", 0.01, basic=False, label="Alpha Factor"),
             Param("as_real", 0.0, basic=False, label="Structural Scattering (Real)"),
             Param("as_imag", 0.0, basic=False, label="Structural Scattering (Imag)"),
@@ -138,7 +148,12 @@ NODE_TYPES = {
             Param("enable_gated", 1, basic=False, label="Gated Mode"),
 
             Param("pie_bits", "0,1,0,1", basic=False, label="Expected Command Bits"),
-            Param("p_th", 0.001, basic=False, label="Harvesting Threshold"),
+            # Tari of the reader command, which this tag's command detector
+            # must know to read it. NOT typed by hand: copied from the tag's
+            # sender at every Start (CanvasWindow._sync_tag_tari_from_senders),
+            # so it always matches. Was hard-coded 12.5 in every tag block.
+            Param("tari", 12.5, basic=False, label="Tari (from sender, µs)"),
+            Param("p_th", 3.16e-5, basic=False, label="Harvesting Threshold"),  # -15 dBm: passive UHF chip (was 0 dBm)
             Param("alpha", 0.01, basic=False, label="Alpha Factor"),
             Param("as_real", 0.05, basic=False, label="Structural Scattering (Real)"),
             Param("as_imag", 0.02, basic=False, label="Structural Scattering (Imag)"),
@@ -167,8 +182,13 @@ NODE_TYPES = {
             Param("m", 2, basic=True, label="Miller Order (M)"),   # changes the encoding scheme itself
 
             Param("pie_bits", "0,1,0,1", basic=False, label="Expected Command Bits"),
+            # Tari of the reader command, which this tag's command detector
+            # must know to read it. NOT typed by hand: copied from the tag's
+            # sender at every Start (CanvasWindow._sync_tag_tari_from_senders),
+            # so it always matches. Was hard-coded 12.5 in every tag block.
+            Param("tari", 12.5, basic=False, label="Tari (from sender, µs)"),
             Param("mod_depth", 1.0, basic=False, label="Modulation Depth"),
-            Param("p_th", 0.001, basic=False, label="Harvesting Threshold"),
+            Param("p_th", 3.16e-5, basic=False, label="Harvesting Threshold"),  # -15 dBm: passive UHF chip (was 0 dBm)
             Param("alpha", 0.01, basic=False, label="Alpha Factor"),
             Param("as_real", 0.05, basic=False, label="Structural Scattering (Real)"),
             Param("as_imag", 0.02, basic=False, label="Structural Scattering (Imag)"),
@@ -197,7 +217,7 @@ NODE_TYPES = {
             Param("analog_mode", 0, basic=True, label="Analog Mode"),   # selects preset vs custom gamma below
 
             Param("mod_depth", 0.8, basic=False, label="Modulation Depth"),
-            Param("p_th", 0.001, basic=False, label="Harvesting Threshold"),
+            Param("p_th", 3.16e-5, basic=False, label="Harvesting Threshold"),  # -15 dBm: passive UHF chip (was 0 dBm)
             Param("alpha", 0.01, basic=False, label="Alpha Factor"),
             Param("as_real", 0.05, basic=False, label="Structural Scattering (Real)"),
             Param("as_imag", 0.02, basic=False, label="Structural Scattering (Imag)"),
@@ -229,7 +249,7 @@ NODE_TYPES = {
             Port("Data_Out", "out", "byte"),
         ],
         params=[
-            Param("si_enable", 1, basic=True, label="Enable Self-Interference Cancellation"),
+            Param("si_enable", 0, basic=True, label="Add Transmitter Leakage"),
             # dc_len: see rx_bpsk's own dc_len comment below -- same
             # Tier-1 edit (hers, not mine), same reasoning, same generic
             # exposure path. OOK and BPSK are the two modulations that
@@ -242,19 +262,23 @@ NODE_TYPES = {
             # long a run in the first place, which is exactly why she
             # reported no problem there even before this param existed.
             Param("dc_len", 1024, basic=True, label="DC Blocker Length (samples)"),
-            Param("si_isolation_db", 25.0, basic=False, label="SI Isolation (dB)"),
+            Param("si_isolation_db", 30.0, basic=False, label="Leakage Isolation (dB)"),  # ~30 dB monostatic antennas (Ryu 2026)
+            # Angle of the leaked carrier relative to the transmitted one
+            # (2026-11-16). 180 = the old fixed behaviour (leak added with a
+            # minus sign). In real hardware it depends on cables/antenna and is
+            # effectively random. OOK suffers most near 90 deg (see tooltip).
+            Param("leak_phase_deg", 180.0, basic=False, label="Leakage Angle (deg)"),
             # Receiver averaging (Tier-1, 2026-11-11, calibration-plan item 7):
             # moving average right before the slicer. Off = identical to the old
             # per-sample decision. Length is normally filled automatically from
             # the bit rate (NodeItem.avg_len_auto, ui/canvas_window.py).
-            # UI default OFF for now (block default is 1): tested 2026-11-11,
-            # averaging only helps once the decoder samples the middle of the
-            # good timing range; packet_hex_decoder (OOK/BPSK) samples at an
-            # arbitrary point and the FM0/Miller decoders lock on the FIRST
-            # working offset, so with averaging on, results were worse about
-            # half the time. Flip to 1 once the decoders get centre-of-eye
-            # timing (claude/receiver-averaging.md).
-            Param("enable_avg", 0, basic=True, label="Enable Receiver Averaging"),
+            # UI default (2026-11-16): ON for OOK/BPSK/Miller -- the decoders
+            # now sample the centre of the bit, and Geethika's tests decode
+            # with and without it (much better under noise with it). OFF for
+            # FM0: with averaging it showed header bit errors even at dc_len
+            # 500-2000 (open issue, see claude/receiver-averaging.md). Saved
+            # layouts keep whatever they saved; this only seeds new receivers.
+            Param("enable_avg", 1, basic=True, label="Enable Receiver Averaging"),  # ON by default (2026-11-16, tested by Geethika)
             Param("avg_len", 100, basic=False, label="Averaging Length (samples)"),
             Param("samp_rate", 2e6, basic=False, label="Sample Rate"),
         ],
@@ -269,7 +293,7 @@ NODE_TYPES = {
             Port("Data_Out", "out", "byte"),
         ],
         params=[
-            Param("si_enable", 1, basic=True, label="Enable Self-Interference Cancellation"),
+            Param("si_enable", 0, basic=True, label="Add Transmitter Leakage"),
             # dc_len: backscatter_rx_bpsk.py now exposes the dc_blocker_cc
             # length as a constructor param (Tier-1 edit, not mine --
             # was hardcoded at 1024 before). Exposed here purely so the
@@ -283,7 +307,12 @@ NODE_TYPES = {
             # generic over NodeType.params (see modulation_middleware.py's
             # _build_node()).
             Param("dc_len", 1024, basic=True, label="DC Blocker Length (samples)"),
-            Param("si_isolation_db", 25.0, basic=False, label="SI Isolation (dB)"),
+            Param("si_isolation_db", 30.0, basic=False, label="Leakage Isolation (dB)"),  # ~30 dB monostatic antennas (Ryu 2026)
+            # Angle of the leaked carrier relative to the transmitted one
+            # (2026-11-16). 180 = the old fixed behaviour (leak added with a
+            # minus sign). In real hardware it depends on cables/antenna and is
+            # effectively random. OOK suffers most near 90 deg (see tooltip).
+            Param("leak_phase_deg", 180.0, basic=False, label="Leakage Angle (deg)"),
             # Costas-loop phase tracking (Tier-1, 2026-11-11, calibration-plan
             # item 6): rotates the backscatter back onto the real axis before
             # complex_to_real. Smaller = steadier in noise, slower to lock.
@@ -292,14 +321,13 @@ NODE_TYPES = {
             # moving average right before the slicer. Off = identical to the old
             # per-sample decision. Length is normally filled automatically from
             # the bit rate (NodeItem.avg_len_auto, ui/canvas_window.py).
-            # UI default OFF for now (block default is 1): tested 2026-11-11,
-            # averaging only helps once the decoder samples the middle of the
-            # good timing range; packet_hex_decoder (OOK/BPSK) samples at an
-            # arbitrary point and the FM0/Miller decoders lock on the FIRST
-            # working offset, so with averaging on, results were worse about
-            # half the time. Flip to 1 once the decoders get centre-of-eye
-            # timing (claude/receiver-averaging.md).
-            Param("enable_avg", 0, basic=True, label="Enable Receiver Averaging"),
+            # UI default (2026-11-16): ON for OOK/BPSK/Miller -- the decoders
+            # now sample the centre of the bit, and Geethika's tests decode
+            # with and without it (much better under noise with it). OFF for
+            # FM0: with averaging it showed header bit errors even at dc_len
+            # 500-2000 (open issue, see claude/receiver-averaging.md). Saved
+            # layouts keep whatever they saved; this only seeds new receivers.
+            Param("enable_avg", 1, basic=True, label="Enable Receiver Averaging"),  # ON by default (2026-11-16, tested by Geethika)
             Param("avg_len", 100, basic=False, label="Averaging Length (samples)"),
             Param("samp_rate", 2e6, basic=False, label="Sample Rate"),
         ],
@@ -315,7 +343,7 @@ NODE_TYPES = {
         ],
         params=[
             Param("bit_rate", 10000, basic=True, label="Bit Rate"),
-            Param("si_enable", 1, basic=True, label="Enable Self-Interference Cancellation"),
+            Param("si_enable", 0, basic=True, label="Add Transmitter Leakage"),
             # dc_len: exposed for consistency with rx_ook/rx_bpsk (same
             # Tier-1 edit, same dc_blocker_cc underneath) -- FM0 doesn't
             # actually NEED this lever day to day. Its self-clocking
@@ -336,8 +364,13 @@ NODE_TYPES = {
             # that grouping, same as every other NodeType here; no
             # functional change, params are matched by name everywhere
             # else, never by position.
-            Param("threshold", 0.02, basic=False, label="Slicer Threshold"),
-            Param("si_isolation_db", 25.0, basic=False, label="SI Isolation (dB)"),
+            Param("threshold", 1e-6, basic=False, label="Slicer Threshold"),  # absolute! 0.02 never fires at real signal levels; 1e-6 = ~5x the -104 dBm noise
+            Param("si_isolation_db", 30.0, basic=False, label="Leakage Isolation (dB)"),  # ~30 dB monostatic antennas (Ryu 2026)
+            # Angle of the leaked carrier relative to the transmitted one
+            # (2026-11-16). 180 = the old fixed behaviour (leak added with a
+            # minus sign). In real hardware it depends on cables/antenna and is
+            # effectively random. OOK suffers most near 90 deg (see tooltip).
+            Param("leak_phase_deg", 180.0, basic=False, label="Leakage Angle (deg)"),
             # Costas-loop phase tracking (Tier-1, 2026-11-11, calibration-plan
             # item 6): rotates the backscatter back onto the real axis before
             # complex_to_real. Smaller = steadier in noise, slower to lock.
@@ -346,14 +379,13 @@ NODE_TYPES = {
             # moving average right before the slicer. Off = identical to the old
             # per-sample decision. Length is normally filled automatically from
             # the bit rate (NodeItem.avg_len_auto, ui/canvas_window.py).
-            # UI default OFF for now (block default is 1): tested 2026-11-11,
-            # averaging only helps once the decoder samples the middle of the
-            # good timing range; packet_hex_decoder (OOK/BPSK) samples at an
-            # arbitrary point and the FM0/Miller decoders lock on the FIRST
-            # working offset, so with averaging on, results were worse about
-            # half the time. Flip to 1 once the decoders get centre-of-eye
-            # timing (claude/receiver-averaging.md).
-            Param("enable_avg", 0, basic=True, label="Enable Receiver Averaging"),
+            # UI default (2026-11-16): ON for OOK/BPSK/Miller -- the decoders
+            # now sample the centre of the bit, and Geethika's tests decode
+            # with and without it (much better under noise with it). OFF for
+            # FM0: with averaging it showed header bit errors even at dc_len
+            # 500-2000 (open issue, see claude/receiver-averaging.md). Saved
+            # layouts keep whatever they saved; this only seeds new receivers.
+            Param("enable_avg", 0, basic=True, label="Enable Receiver Averaging"),  # OFF for FM0: with averaging, header bit errors at dc_len 500-2000 (2026-11-16)
             Param("avg_len", 25, basic=False, label="Averaging Length (samples)"),
             Param("samp_rate", 2e6, basic=False, label="Sample Rate"),
             # The embedded FM0 decoder now re-syncs once per packet instead
@@ -379,14 +411,18 @@ NODE_TYPES = {
         params=[
             Param("bit_rate", 10000, basic=True, label="Bit Rate"),
             Param("m", 2, basic=True, label="Miller Order (M)"),   # must match the tag's own m
-            Param("si_enable", 1, basic=True, label="Enable Self-Interference Cancellation"),
+            Param("si_enable", 0, basic=True, label="Add Transmitter Leakage"),
             # dc_len: see rx_fm0's own dc_len comment above -- same
             # reasoning applies here (Miller is self-clocking too, so
             # this isn't a lever Miller actually needs for the OOK/
             # BPSK-style long-run problem), exposed for consistency and
             # future experimentation.
             Param("dc_len", 1024, basic=True, label="DC Blocker Length (samples)"),
-            Param("si_isolation_db", 25.0, basic=False, label="SI Isolation (dB)"),
+            Param("si_isolation_db", 30.0, basic=False, label="Leakage Isolation (dB)"),  # ~30 dB monostatic antennas (Ryu 2026)
+            # see rx_ook: angle of the leaked carrier, 180 = old behaviour of the
+            # others. (Miller's own old leak had no minus sign = 0 deg; now
+            # consistent with OOK/BPSK/FM0.)
+            Param("leak_phase_deg", 180.0, basic=False, label="Leakage Angle (deg)"),
             # Costas-loop phase tracking (Tier-1, 2026-11-11, calibration-plan
             # item 6): rotates the backscatter back onto the real axis before
             # complex_to_real. Smaller = steadier in noise, slower to lock.
@@ -395,14 +431,13 @@ NODE_TYPES = {
             # moving average right before the slicer. Off = identical to the old
             # per-sample decision. Length is normally filled automatically from
             # the bit rate (NodeItem.avg_len_auto, ui/canvas_window.py).
-            # UI default OFF for now (block default is 1): tested 2026-11-11,
-            # averaging only helps once the decoder samples the middle of the
-            # good timing range; packet_hex_decoder (OOK/BPSK) samples at an
-            # arbitrary point and the FM0/Miller decoders lock on the FIRST
-            # working offset, so with averaging on, results were worse about
-            # half the time. Flip to 1 once the decoders get centre-of-eye
-            # timing (claude/receiver-averaging.md).
-            Param("enable_avg", 0, basic=True, label="Enable Receiver Averaging"),
+            # UI default (2026-11-16): ON for OOK/BPSK/Miller -- the decoders
+            # now sample the centre of the bit, and Geethika's tests decode
+            # with and without it (much better under noise with it). OFF for
+            # FM0: with averaging it showed header bit errors even at dc_len
+            # 500-2000 (open issue, see claude/receiver-averaging.md). Saved
+            # layouts keep whatever they saved; this only seeds new receivers.
+            Param("enable_avg", 1, basic=True, label="Enable Receiver Averaging"),  # ON by default (2026-11-16, tested by Geethika)
             Param("avg_len", 12, basic=False, label="Averaging Length (samples)"),
             Param("samp_rate", 2e6, basic=False, label="Sample Rate"),
             # See rx_fm0's own payload_len/preamble comment -- same fix,
@@ -421,8 +456,8 @@ NODE_TYPES = {
             Port("Data_Out", "out", "float"),   # float, not byte -- the odd one out, matches tag_analog's float side
         ],
         params=[
-            Param("si_enable", 1, basic=True, label="Enable Self-Interference Cancellation"),
-            Param("si_isolation_db", 25.0, basic=False, label="SI Isolation (dB)"),
+            Param("si_enable", 0, basic=True, label="Add Transmitter Leakage"),
+            Param("si_isolation_db", 30.0, basic=False, label="Leakage Isolation (dB)"),  # ~30 dB monostatic antennas (Ryu 2026)
             Param("samp_rate", 2e6, basic=False, label="Sample Rate"),
         ],
     ),
@@ -454,7 +489,22 @@ NODE_TYPES = {
             # --- basic: what you'd actually turn while testing ---
             Param("distance", 2, basic=True, label="Distance (m)"),
             Param("fading_type_c1", 0, basic=True, label="Fading Model"),
-            Param("noise_volt_c1", 0.01, basic=True, label="Noise Power"),  # shown in dBm by the UI; stored as noise voltage (core/units.py)
+            # Seed of the block's fading_model random generator. Same seed =
+            # the exact same fade pattern, and every channel steps through it
+            # in lock-step, so two channels with one seed fade identically.
+            # The UI gives every NEW channel its own random seed (a reader's
+            # hidden return leg copies its forward leg's seed: one physical
+            # path). Kept fixed between runs unless "Same fades every run" is
+            # unticked. This default only matters for code that bypasses the
+            # UI. calibration-plan item 8.
+            Param("fade_seed", 0, basic=False, label="Fading Seed"),
+            # Fading character (calibration-plan item 8, 2026-11-16). Were
+            # hard-coded in the block (K 10, 10 Hz). rician_k: direct-path power
+            # over scattered power (linear; 10 = strong line of sight, ~0 =
+            # Rayleigh-like). doppler_hz: how fast the fades change (0 = frozen).
+            Param("rician_k", 10.0, basic=False, label="Rician K Factor"),
+            Param("doppler_hz", 1.0, basic=False, label="Fade Speed (Hz)"),  # static tags, people moving around (was 10 Hz = walking)
+            Param("noise_volt_c1", 2.0e-7, basic=True, label="Noise Power"),  # -104 dBm = kTB over 2 MHz + 7 dB NF (was -10 dBm)  # shown in dBm by the UI; stored as noise voltage (core/units.py)
 
             # --- advanced: fixed physical assumptions behind friis_gain ---
             Param("freq", 915e6, basic=False, label="Carrier Frequency"),
@@ -487,8 +537,17 @@ NODE_TYPES = {
             Port("Tx_Leakage_Out", "out", "complex"),
         ],
         params=[
+            # Reader warm-up (calibration-plan item 10, 2026-11-16): plain
+            # carrier for this long BEFORE the command, like a real reader
+            # powering the field up. Its receiver settles on its own leakage
+            # first, and gated tags (which wait for the command) reply after.
+            # Without it, carrier-on, command and tag reply all happened within
+            # ~0.06 ms of Start, and with transmitter leakage on the first
+            # packet was lost (real-chain test: any warm-up >= 2 ms fixed it,
+            # dc_len up to 4096). 0 = off = the old behaviour.
+            Param("warmup_us", 10000.0, basic=False, label="Reader Warm-up (us)"),
             Param("tari", 12.5, basic=True, label="Tari (reader symbol time, µs)"),
-            Param("tx_power_send", 20, basic=True, label="Tx Power"),
+            Param("tx_power_send", 1.0, basic=True, label="Tx Power"),  # 30 dBm = UHF RFID reader (was 56 dBm)
             Param("enable_gated", 1, basic=False, label="Gated Mode"),
 
             Param("command_bits", (0, 1, 0, 1), basic=False, label="Reader Command Bits"),

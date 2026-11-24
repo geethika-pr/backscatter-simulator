@@ -25,7 +25,9 @@ Core interactions:
   - Delete removes selected nodes/edges; Clear wipes the canvas (both
     disabled while running). Save/Load persist named layouts as JSON;
     canvas_default_layout.json auto-loads on startup.
-  - Plain scroll pans (vertical and horizontal); Ctrl+scroll zooms.
+  - Plain scroll pans (vertical and horizontal); Ctrl+scroll zooms
+    toward the mouse; Ctrl+0 zooms to fit every node. The scrollable
+    area grows to cover every node (CanvasView.update_scene_bounds()).
 
 Known gaps, not yet addressed:
   - No port-dtype checking on connect -- a bad wiring (type mismatch,
@@ -58,6 +60,7 @@ from PyQt6 import QtWidgets, QtCore, QtGui
 
 import csv
 import json
+import random
 import os
 
 import core.registry as registry
@@ -122,10 +125,10 @@ AUTO_WIRED_PORTS = {
 # to catch, si_isolation_db=25.0 which breaks OOK specifically), so every
 # new node is seeded with these validated values instead. "channel" has
 # no role yet when freshly dropped, so it's seeded at the forward
-# channel's values (distance=1, noise_volt_c1=0.02).
+# channel's values (distance=1, noise_volt_c1=2e-7 = -104 dBm).
 NODE_SEED_OVERRIDES = {
     "sender": {"enable_gated": 1},
-    "channel": {"distance": 1, "noise_volt_c1": 0.02},
+    "channel": {"distance": 1, "noise_volt_c1": 2.0e-7},   # -104 dBm (2026-11-16, was 0.02 = -4 dBm)
     "tag_ook": dict(DEFAULT_TAG_OVERRIDES),
     "tag_bpsk": dict(DEFAULT_TAG_OVERRIDES),
     "tag_fm0": dict(DEFAULT_TAG_OVERRIDES),
@@ -173,6 +176,137 @@ DECODE_RANGE_SNR_THRESHOLD_DB = 6.0
 # someone using the UI, whatever it is further down), writing back int
 # 0/1 rather than True/False to match the registry default's own type
 # exactly, in case a constructor is strict about it.
+def _rx_avg_gain_db(rx, bit_rate):
+    """SNR gain (dB) the receiver's averaging gives, for the decode ring:
+    10*log10(averaging length) when "Enable Receiver Averaging" is ticked,
+    else 0. Same gain the BER plot already adds (_resolve_decision_snr_for_
+    tag). With Auto length on, the length is worked out from the tag's bit
+    rate right here, so the ring follows the tick/length immediately --
+    no Start needed."""
+    if rx.type_name not in AVERAGING_RX_TYPES or not int(rx.params.get("enable_avg", 0) or 0):
+        return 0.0
+    if getattr(rx, "avg_len_auto", None) and bit_rate:
+        length = ber_theory.recommended_avg_len(
+            rx.type_name, float(bit_rate), rx.params.get("samp_rate", SAMP_RATE), rx.params.get("m", 2))
+    else:
+        length = int(rx.params.get("avg_len", 1) or 1)
+    return 10.0 * math.log10(max(1, int(length)))
+
+
+def _new_fade_seed():
+    """A fresh seed for a channel's fading generator (calibration-plan
+    item 8). Range fits the inspector's integer box (+-10,000,000)."""
+    return random.randint(1, 9_999_999)
+
+
+# Polarization mismatch loss (calibration-plan item 9), stored WITH the
+# link's other channel settings so save/load, paste, modulation switch and
+# a reader's hidden return leg all carry it like any other setting. It is
+# NOT a registry Param and NOT a block argument: the block never sees it.
+# Physically it's an extra loss between the two antennas of this link, so
+# it is applied as a lower effective antenna gain -- in scene_to_topology()
+# (what the block gets) and in every ring/energy/BER formula, through
+# _effective_channel_params()/_effective_g_tag_dbi(), so the rings always
+# match the run.
+POL_LOSS_KEY = "pol_loss_db"
+
+
+def _effective_g_tag_dbi(channel_params):
+    """The tag-side antenna gain this link really uses: the typed
+    g_tag_dbi minus the polarization loss. (Which side it comes off makes
+    no difference -- Friis only uses g_reader_dbi + g_tag_dbi.)"""
+    g = channel_params.get("g_tag_dbi")
+    if g is None:
+        return None
+    return float(g) - float(channel_params.get(POL_LOSS_KEY, 0.0) or 0.0)
+
+
+def _effective_channel_params(channel_params):
+    """Copy of a link's settings as the channel BLOCK should get them:
+    polarization loss folded into g_tag_dbi and the UI-only key removed
+    (an unknown argument would crash the block at Start)."""
+    out = dict(channel_params)
+    out.pop(POL_LOSS_KEY, None)
+    if "g_tag_dbi" in out:
+        out["g_tag_dbi"] = _effective_g_tag_dbi(channel_params)
+    return out
+
+
+# Channel settings that belong to ONE channel and must never be copied
+# onto a different channel (paste): its distance (geometry) and its fade
+# pattern (a new channel is a new physical path, so a new fade).
+CHANNEL_IDENTITY_PARAMS = ("distance", "fade_seed")
+
+# Transmitter leakage (calibration-plan item 10). Shown on EVERY receiver
+# since 2026-11-16 -- it used to be hidden on standalone receivers, where an
+# old layout could still carry it switched ON invisibly (that silently cost
+# BPSK its first packet, claude/first-packet-loss-fix.md).
+LEAK_TOOLTIPS = {
+    "leak_phase_deg": (
+        "Angle of the leaked carrier compared with the transmitted one (degrees).\n"
+        "Default 180 = the simulator's old fixed behaviour. In real hardware it depends\n"
+        "on cables and antennas, so it is effectively random.\n"
+        "BPSK/FM0/Miller don't care (phase tracking / transitions). OOK (which only\n"
+        "looks at signal strength) does a little: near 0 or 180 the tag changes the\n"
+        "strength fully (180 = inverted, which 'Accept Inverted Preamble' handles);\n"
+        "near 90 the leak is sideways to the tag's reflection, so the tag changes the\n"
+        "strength less and noise matters more. In tests the effect was small (OOK\n"
+        "reader, 15-25 dB isolation: 8/8 at 180 vs 7/8 at 90).\n"
+        "Only used when 'Add Transmitter Leakage' is ticked."),
+    "rician_k": (
+        "Rician K factor (linear, not dB): how strong the direct path is compared with\n"
+        "all the scattered reflections. Only used when Fading Model = Rician.\n"
+        "10 (default) = strong line of sight, mild fades; 1-3 = cluttered, deeper\n"
+        "fades; near 0 behaves like Rayleigh (no direct path).\n"
+        "Measured examples: indoor line of sight ~10 dB (K=10), outdoor ~3 dB (K=2)\n"
+        "(Griffin & Durgin, via Sheikh 2019)."),
+    "doppler_hz": (
+        "How fast the fading changes (Hz). Default 10.\n"
+        "0 = frozen: one fade value for the whole run (still tag, still people).\n"
+        "Higher = faster changes (things moving around the link). Roughly speed /\n"
+        "wavelength: walking pace (~1 m/s) at 915 MHz is ~3 Hz.\n"
+        "Only used when Fading Model is Rician or Rayleigh."),
+    "warmup_us": (
+        "How long the reader sends plain carrier before its command (microseconds).\n"
+        "Default 10000 = 10 ms. 0 = off (command at the very first sample, the old\n"
+        "behaviour).\n"
+        "Real readers do this: passive tags need power-up time before they can\n"
+        "answer, and the reader's own receiver settles on its transmitter leakage\n"
+        "meanwhile. Without it, with 'Add Transmitter Leakage' on, the first packet\n"
+        "was lost (tests: 2 ms or more fixed it, DC blocker length up to 4096).\n"
+        "Only delays tags in Gated Mode (they wait for the command); non-gated tags\n"
+        "start at once regardless."),
+    "si_enable": (
+        "Adds the transmitter's own carrier into this receiver, weakened by\n"
+        "'Leakage Isolation (dB)'. Unticked = no leakage at all (ideal).\n"
+        "Reader: its own transmitter leaking into its receiver through the shared\n"
+        "antenna / circulator -- always present in real hardware, so new readers\n"
+        "start with it ticked.\n"
+        "Separate receiver: the sender's signal reaching this receiver directly\n"
+        "(the direct path) -- also real, usually much stronger than the tag.\n"
+        "Off by default for separate receivers.\n"
+        "Note: with leakage on, the carrier switching on at Start and the reader's\n"
+        "command can upset the DC blocker just as the tag starts replying (can cost\n"
+        "the first packet). Real readers avoid this with start-up behaviour the\n"
+        "simulator doesn't model yet."),
+    "si_isolation_db": (
+        "How much weaker the leaked carrier is than the transmitted one (dB).\n"
+        "Bigger = less leakage. Default 40 dB.\n"
+        "Real readers: ~17 dB with a plain circulator (Wang 2020), >30 dB with a\n"
+        "good antenna design (Ryu 2026), more with active cancellation.\n"
+        "Only used when 'Add Transmitter Leakage' is ticked."),
+}
+
+def _shape_special_widget(name, widget):
+    """Per-setting widget tweaks beyond the generic factory: the leak angle
+    is an angle, so 0-360 degrees with wrap-around (370 == 10)."""
+    if name == "leak_phase_deg" and isinstance(widget, QtWidgets.QDoubleSpinBox):
+        widget.setRange(0.0, 360.0)
+        widget.setWrapping(True)
+        widget.setSingleStep(15.0)
+        widget.setSuffix(" deg")
+
+
 BOOLEAN_INT_PARAMS = {"enable_gated", "si_enable", "enable_mac", "accept_inverted", "model_phase", "enable_avg"}
 
 # Receivers whose blocks have the moving-average stage (enable_avg/avg_len)
@@ -186,18 +320,24 @@ _AVG_AUTO_TOOLTIP = (
     "Untick to type your own length. Too long smears neighbouring levels together and "
     "causes errors even with no noise; longer (within that limit) = less noise: "
     "+10*log10(length) dB.\n\n"
-    "Averaging is OFF by default for now: it only helps when the decoder samples the "
-    "middle of each bit, and the current decoders don't choose their sampling point "
-    "that way yet (in tests, results got worse about half the time)."
+    "Averaging is ON by default for new OOK/BPSK/Miller receivers (the decoders sample "
+    "the middle of each bit). OFF by default for FM0: with averaging it still showed "
+    "bit errors in tests, so tick it there only to experiment."
 )
 
 # Decoder settings whose sensible default depends on the receiver type,
 # applied on top of packet_hex_decoder's registry defaults when a receiver
 # is created AND when a receiver's modulation is switched (the old type's
 # choice may be wrong for the new one). accept_inverted: BPSK's Costas loop
-# can lock 180 deg off, inverting every bit -- see registry.py.
+# can lock 180 deg off, inverting every bit -- see registry.py. OOK
+# (2026-11-16): with transmitter leakage on, the leaked carrier is added
+# with the opposite sign to the tag's reflection, so the envelope DROPS when
+# the tag reflects a "1" -- every OOK bit arrives inverted. Measured in the
+# real chain (reader, OOK, leakage 40/25 dB): nothing decoded with it off,
+# all but packet 0 with it on; leakage off decodes 8/8 either way.
 DECODER_DEFAULTS_BY_RX = {
     "rx_bpsk": {"accept_inverted": 1},
+    "rx_ook": {"accept_inverted": 1},
 }
 
 # Params the inspector SHOWS in dBm while the stored value (node.params /
@@ -244,7 +384,10 @@ DBM_DECIMALS = 2
 # feedback so far; add more names here if another float param needs its
 # own tighter display, rather than changing the global default and
 # risking a different param that genuinely wants 4.
-PARAM_DECIMALS = {"distance": 2}
+PARAM_DECIMALS = {"distance": 2,
+                  # FM0 slicer threshold is absolute and now tiny (1e-6, realistic
+                  # signal levels): 4 decimals would show 0.0000 and save 0.
+                  "threshold": 8}
 
 # Enum-like int params with GRC-documented word labels per value (from
 # the source block's .block.yml "label:" field). Rendered as a
@@ -287,17 +430,36 @@ DEFAULT_LAYOUT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 def _check_known_requirements(nodes, edges):
     """Checks requirements plan_topology() doesn't (it only resolves
     port names) but that gnuradio's real flowgraph validation rejects at
-    Start with an opaque error. Currently one rule: every rx_* needs its
-    Tx_Leakage_In fed -- every rx_* hier-block wires its self-
-    interference multiply_const_cc to Tx_Leakage_In unconditionally in
-    __init__ (not gated by si_enable), so an unfed input crashes with
-    "insufficient connected input ports". scene_to_topology() auto-wires
-    that port from any sender on the canvas, so this check really means
-    "is there a sender" -- not a stand-in for general port-dtype
-    validation (still not implemented).
+    Start with an opaque error ("insufficient connected input/output
+    ports", "missing connection to input port 0"). Each rule below was
+    reproduced against the real blocks before being added:
+
+    - every rx_* needs its Tx_Leakage_In fed -- every rx_* hier-block
+      wires its self-interference multiply_const_cc to Tx_Leakage_In
+      unconditionally in __init__ (not gated by si_enable).
+      scene_to_topology() auto-wires that port from any sender on the
+      canvas, so this rule really means "is there a sender".
+    - every tag_* needs its Carrier_In fed (no sender linked to it ->
+      its internal PIE decoder has an unconnected input).
+    - every tag_* needs its output (out / Reflection_Out) to feed
+      something (no receiver linked to it -> its Complex Gamma Modulator
+      has an unconnected output). This was the "several tags on a
+      sender, no receiver" crash.
+    - every rx_* needs its Antenna_In fed (no tag linked to it -> its
+      selector has an unconnected input). A lone reader hits this.
+    - an explicit "channel" box (old saved layouts only) needs both its
+      Signal_In fed and its out feeding something.
+
+    Not a stand-in for general port-dtype validation (still not
+    implemented); on_start() also catches anything gnuradio still
+    rejects, so an unknown case shows a message instead of crashing.
     """
     node_types = {n["id"]: n["type"] for n in nodes}
     edge_targets = {(to_id, to_port) for (_from_id, _from_port, to_id, to_port) in edges}
+    edge_sources = {(from_id, from_port) for (from_id, from_port, _to_id, _to_port) in edges}
+
+    def _out_ports(type_name):
+        return [p.name for p in registry.NODE_TYPES[type_name].ports if p.direction == "out"]
 
     problems = []
     for node_id, type_name in node_types.items():
@@ -308,6 +470,46 @@ def _check_known_requirements(nodes, edges):
                 "manual wire needed) -- so this means there's no sender node on the "
                 "canvas at all, not that a connection is missing. Add one."
             )
+        if type_name.startswith("rx_") and (node_id, "Antenna_In") not in edge_targets:
+            reader_id = node_id[:-len("_rx")] if node_id.endswith("_rx") else None
+            if reader_id is not None and node_types.get(reader_id) == "sender":
+                # a reader's hidden rx half (add_reader() names it
+                # "<reader_id>_rx") -- name the box the user can see
+                problems.append(
+                    f"Reader '{reader_id}' has no tag linked to it, so its receiver "
+                    "has nothing to listen to. Draw a link from the reader to a tag, "
+                    "or delete it."
+                )
+            else:
+                problems.append(
+                    f"'{node_id}' ({type_name}) has nothing to listen to: no tag is "
+                    "linked to it. Draw a link from a tag to this receiver, or delete it."
+                )
+        if type_name.startswith("tag_"):
+            if (node_id, "Carrier_In") not in edge_targets:
+                problems.append(
+                    f"'{node_id}' ({type_name}) has no sender: nothing gives it a "
+                    "carrier to reflect. Draw a link from a sender (or reader) to "
+                    "this tag, or delete it."
+                )
+            if not any((node_id, port) in edge_sources for port in _out_ports(type_name)):
+                problems.append(
+                    f"'{node_id}' ({type_name}) has no receiver: its reflected signal "
+                    "isn't linked to anything, and GNU Radio won't start with a loose "
+                    "output. Draw a link from this tag to a receiver (rx_ node or "
+                    "reader), or delete the tag."
+                )
+        if type_name == "channel":
+            if (node_id, "Signal_In") not in edge_targets:
+                problems.append(
+                    f"'{node_id}' (channel box) has nothing feeding its Signal_In. "
+                    "Link something into it, or delete it."
+                )
+            if not any((node_id, port) in edge_sources for port in _out_ports(type_name)):
+                problems.append(
+                    f"'{node_id}' (channel box)'s output isn't linked to anything. "
+                    "Link it onward, or delete it."
+                )
     return problems
 
 
@@ -820,6 +1022,12 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         self.show_wake_ranges = False
         self.show_decode_range = False
         self.decode_snr_threshold_db = DECODE_RANGE_SNR_THRESHOLD_DB
+        # Fade margin (dB) for the range rings this node owns: a sender's
+        # wake-up rings, a receiver's decode rings. 0 = no margin (the old
+        # rings). Link budgets reserve this so the link still works when a
+        # fade hits: ~6 dB indoor LOS, ~15 dB outdoor (Sheikh 2019, 5% outage).
+        # Rings only -- the simulation itself is not changed by it.
+        self.ring_fade_margin_db = 0.0
         self._identity_highlight_item = None
 
         # Combined "reader" block (CanvasWindow.add_reader()): None for
@@ -1185,6 +1393,14 @@ class EdgeItem(QtWidgets.QGraphicsPathItem):
             # immediately replaced below anyway, but the cast stays as
             # a type guarantee regardless.
             self.channel_params["distance"] = float(self.channel_params["distance"])
+            # Every NEW channel gets its own fade pattern. (Before, every
+            # channel used seed 0, so all channels -- every tag, both legs --
+            # faded identically, and every run replayed the same fades.)
+            # Load/paste/modulation-switch then overwrite or keep it as
+            # appropriate; a reader's hidden return leg copies its forward
+            # leg's seed in _wire_reader_shadow_return().
+            self.channel_params["fade_seed"] = _new_fade_seed()
+            self.channel_params[POL_LOSS_KEY] = 0.0
         else:
             self.channel_params = None
         # This edge's channel node id from the LAST scene_to_topology()
@@ -1310,17 +1526,65 @@ class CanvasView(QtWidgets.QGraphicsView):
     # wrong adjacent port.
     SNAP_PIXELS = 12
 
+    # The canvas used to be a FIXED 4000 x 4000 px box (+-4 m at
+    # PIXELS_PER_METER = 500), so a tag typed to 10 m away landed outside
+    # it and the scrollbars hit a wall. Now this is only the MINIMUM area;
+    # update_scene_bounds() grows it to cover every node plus a margin, so
+    # anything placed far away can always be scrolled to at normal zoom.
+    # Size costs nothing to render: Qt only draws what's on screen.
+    BASE_SCENE_RECT = QtCore.QRectF(-2000, -2000, 4000, 4000)
+    MIN_SCENE_MARGIN = 1000  # scene px (2 m) of empty space around the nodes
+
     def __init__(self, window):
         scene = QtWidgets.QGraphicsScene()
-        scene.setSceneRect(-2000, -2000, 4000, 4000)
+        scene.setSceneRect(self.BASE_SCENE_RECT)
         super().__init__(scene)
         self.window = window
+        # Ctrl+scroll zooms toward the mouse, not the middle of the view,
+        # so you can zoom straight in on a far-away tag.
+        self.setTransformationAnchor(QtWidgets.QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setAcceptDrops(True)
         self.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
         self.setDragMode(QtWidgets.QGraphicsView.DragMode.RubberBandDrag)
         self._pending_edge_start = None  # PortHandle (an "out" port) mid-drag, or None
         self._temp_line = None
         self._hover_target = None  # PortHandle currently snap-highlighted during a drag
+
+    def _nodes_bounding_rect(self):
+        rect = QtCore.QRectF()
+        for node in getattr(self.window, "nodes", {}).values():
+            if node.scene() is self.scene():
+                rect = rect.united(node.sceneBoundingRect())
+        return rect
+
+    def update_scene_bounds(self, upcoming_zoom=1.0):
+        """Grow (or shrink back) the scrollable area to cover every node
+        plus a margin of at least half a screen, never smaller than
+        BASE_SCENE_RECT. Called whenever a node is added or moved (dragged
+        or moved by typing a distance), on zoom, and after loading."""
+        rect = QtCore.QRectF(self.BASE_SCENE_RECT)
+        nodes = self._nodes_bounding_rect()
+        if not nodes.isNull():
+            visible = self.mapToScene(self.viewport().rect()).boundingRect()
+            # upcoming_zoom < 1: about to zoom out, so size the margin for
+            # the bigger area that will be visible afterwards
+            m = max(self.MIN_SCENE_MARGIN, visible.width() / 2, visible.height() / 2) / min(1.0, upcoming_zoom)
+            rect = rect.united(nodes.adjusted(-m, -m, m, m))
+        if rect != self.scene().sceneRect():
+            self.scene().setSceneRect(rect)
+
+    def fit_all(self):
+        """Ctrl+0: zoom so every node is on screen."""
+        nodes = self._nodes_bounding_rect()
+        if nodes.isNull():
+            return
+        self.update_scene_bounds()
+        self.fitInView(nodes.adjusted(-100, -100, 100, 100),
+                       QtCore.Qt.AspectRatioMode.KeepAspectRatio)
+        self.update_scene_bounds()
+
+    def _zoom_scale(self):
+        return abs(self.transform().m11()) or 1.0
 
     def _port_near(self, viewport_pos, direction):
         """The topmost non-auto_wired PortHandle of the given direction
@@ -1337,9 +1601,20 @@ class CanvasView(QtWidgets.QGraphicsView):
         if _matches(item):
             return item
 
+        # The snap ring is SNAP_PIXELS on screen, but never wider than a
+        # port's own hit area in scene units. Zoomed far out, a whole node
+        # is only a few screen pixels, and a fixed 12-pixel ring swallowed
+        # it: every click on the node grabbed its output port and started
+        # a link (then "Can't connect a node to itself") instead of
+        # selecting/dragging the node. Capped, the ring stays "on the
+        # port"; clicking the body of a tiny node drags it as usual.
+        port_hit_scene = PortHandle.RADIUS + PortHandle.HIT_PADDING
+        snap = min(self.SNAP_PIXELS, int(port_hit_scene * self._zoom_scale()))
+        if snap < 1:
+            return None
         search_rect = QtCore.QRect(
-            viewport_pos.x() - self.SNAP_PIXELS, viewport_pos.y() - self.SNAP_PIXELS,
-            self.SNAP_PIXELS * 2, self.SNAP_PIXELS * 2,
+            viewport_pos.x() - snap, viewport_pos.y() - snap,
+            snap * 2, snap * 2,
         )
         scene_search_rect = self.mapToScene(search_rect).boundingRect()
         target_scene_pos = self.mapToScene(viewport_pos)
@@ -1423,7 +1698,11 @@ class CanvasView(QtWidgets.QGraphicsView):
             if dy == 0:
                 return
             factor = 1.15 if dy > 0 else 1 / 1.15
+            # grow the area BEFORE zooming out, so the zoom-toward-mouse
+            # anchor isn't clamped by the old scrollable area; tidy after
+            self.update_scene_bounds(upcoming_zoom=factor)
             self.scale(factor, factor)
+            self.update_scene_bounds()
             event.accept()
             return
         # No modifier: defer to QGraphicsView's own scrollbar wheel
@@ -1433,7 +1712,14 @@ class CanvasView(QtWidgets.QGraphicsView):
 
     def drawBackground(self, painter, rect):
         super().drawBackground(painter, rect)
+        # Grid spacing grows with zoom-out (20 px = 4 cm, 100 = 20 cm,
+        # 500 = 1 m, 2500 = 5 m, ...) so lines stay >= ~8 screen pixels
+        # apart. A fixed 20 px grid over a zoomed-out view meant tens of
+        # thousands of lines per repaint.
         grid = 20
+        scale = self._zoom_scale()
+        while grid * scale < 8:
+            grid *= 5
         left = int(rect.left()) - (int(rect.left()) % grid)
         top = int(rect.top()) - (int(rect.top()) % grid)
         lines = []
@@ -1675,9 +1961,13 @@ _ACCEPT_INVERTED_TOOLTIP = (
     "Why: the receiver's phase tracker (Costas loop) can lock 180 degrees off. "
     "For BPSK that turns every 0 into a 1 and vice versa, so the normal preamble "
     "never matches and nothing decodes. On by default for BPSK receivers.\n"
+    "OOK: when 'Add Transmitter Leakage' is on, the leaked carrier points opposite "
+    "to the tag's reflection, so the signal gets WEAKER on a 1 -- every bit arrives "
+    "inverted (in real hardware the leak's angle is arbitrary, so this happens too). "
+    "On by default for OOK receivers.\n"
     "FM0 and Miller carry data in transitions, so inversion doesn't affect them; "
-    "OOK has no phase tracking. Leave it off for those: accepting a second "
-    "pattern doubles the chance of a false packet start on noise."
+    "leave it off there: accepting a second pattern doubles the chance of a false "
+    "packet start on noise."
 )
 
 _PAYLOAD_LEN_BITS_TOOLTIP = (
@@ -2116,6 +2406,24 @@ class NodeInspector(QtWidgets.QWidget):
         )
         self.wake_range_checkbox.toggled.connect(self._on_wake_range_toggled)
         self.scroll_layout.addWidget(self.wake_range_checkbox)
+        # Fade margin for this sender's wake-up rings (NodeItem.
+        # ring_fade_margin_db); shown/hidden together with the checkbox.
+        self.wake_margin_row = QtWidgets.QWidget()
+        _wm = QtWidgets.QHBoxLayout(self.wake_margin_row)
+        _wm.setContentsMargins(0, 0, 0, 0)
+        _wm.addWidget(QtWidgets.QLabel("Wake ring fade margin (dB)"))
+        self.wake_margin_spin = NoScrollDoubleSpinBox()
+        self.wake_margin_spin.setRange(0.0, 40.0)
+        self.wake_margin_spin.setDecimals(1)
+        self.wake_margin_spin.setSingleStep(0.5)
+        self.wake_margin_spin.setToolTip(
+            "Shrinks the ring(s) to leave room for fading: the link must have this many dB to spare.\\n"
+            "0 = no margin. Link budgets typically reserve ~6 dB indoors (line of sight) and\\n"
+            "~15 dB outdoors (Sheikh 2019, for links that work 95% of the time).\\n"
+            "Only changes the ring -- the simulation itself is not affected.")
+        self.wake_margin_spin.valueChanged.connect(self._on_wake_margin_changed)
+        _wm.addWidget(self.wake_margin_spin, 1)
+        self.scroll_layout.addWidget(self.wake_margin_row)
 
         # Payload mode: "Raw bits" is one hand-typed frame repeated
         # forever; "Text message" frames message_text into fragments
@@ -2412,6 +2720,9 @@ class NodeInspector(QtWidgets.QWidget):
         # with reader_rx_item tracked separately for the modulation
         # combo and "Receiver (this reader)" section.
         reader_rx_item = None
+        if node_item is not None and node_item.type_name.startswith("tag_"):
+            # show the Tari this tag will actually use (copied from its sender)
+            self.window._sync_tag_tari_from_senders()
         if node_item is not None and node_item.reader_partner is not None:
             if node_item.type_name.startswith("rx_"):
                 node_item = node_item.reader_partner
@@ -2430,6 +2741,7 @@ class NodeInspector(QtWidgets.QWidget):
             self.modulation_label.setVisible(False)
             self.modulation_combo.setVisible(False)
             self.wake_range_checkbox.setVisible(False)
+            self.wake_margin_row.setVisible(False)
             self._wake_range_owner = None
             self._decode_range_owner = None
             self.payload_mode_label.setVisible(False)
@@ -2488,10 +2800,14 @@ class NodeInspector(QtWidgets.QWidget):
         self._wake_range_owner = node_item if is_sender else None
         show_wake_range_ui = is_sender
         self.wake_range_checkbox.setVisible(show_wake_range_ui)
+        self.wake_margin_row.setVisible(show_wake_range_ui)
         if show_wake_range_ui:
             self.wake_range_checkbox.blockSignals(True)
             self.wake_range_checkbox.setChecked(self._wake_range_owner.show_wake_ranges)
             self.wake_range_checkbox.blockSignals(False)
+            self.wake_margin_spin.blockSignals(True)
+            self.wake_margin_spin.setValue(float(self._wake_range_owner.ring_fade_margin_db or 0.0))
+            self.wake_margin_spin.blockSignals(False)
 
         # "Show decode range" lives on the RECEIVER, not the sender --
         # see the dynamic row built in the standalone-rx "Decoder (this
@@ -2621,14 +2937,19 @@ class NodeInspector(QtWidgets.QWidget):
         # currently) would fall back to the trailing insert below.
         advanced_toggle_inserted = False
         for p in nt.params:
-            # SI cancellation is meaningless for a standalone rx (no
-            # co-located sender) -- hidden entirely rather than just
-            # defaulted off. A reader's own si_enable/si_isolation_db
-            # show normally in "Receiver (this reader)" below, since
-            # that IS the monostatic case this cancellation is for.
-            if p.name in ("si_enable", "si_isolation_db") and node_item.type_name.startswith("rx_"):
-                continue
+            # si_enable/si_isolation_db used to be hidden on a standalone
+            # rx; now shown (LEAK_TOOLTIPS explains what they mean there).
             widget = self._make_param_widget(p.name, node_item.params.get(p.name, p.default))
+            if p.name in LEAK_TOOLTIPS:
+                widget.setToolTip(LEAK_TOOLTIPS[p.name])
+            _shape_special_widget(p.name, widget)
+            if p.name == "tari" and node_item.type_name.startswith("tag_"):
+                widget.setEnabled(False)
+                widget.setToolTip(
+                    "Tari = the length of one short symbol in the reader's command (µs).\n"
+                    "The tag needs the same value as its sender to read the command,\n"
+                    "so it is copied from the sender/reader wired to this tag at every\n"
+                    "Start -- change Tari on the sender instead.")
             if p.name == "packet_bits" and node_item.payload is not None:
                 # Derived now from the readable "Packets to Send" field
                 # above (NodeItem.packets_per_wake/full_cycle_bits(), see
@@ -2744,6 +3065,9 @@ class NodeInspector(QtWidgets.QWidget):
                 widget = make_param_widget(
                     p.name, reader_rx_item.params.get(p.name, p.default),
                     self._on_reader_rx_param_changed)
+                if p.name in LEAK_TOOLTIPS:
+                    widget.setToolTip(LEAK_TOOLTIPS[p.name])
+                _shape_special_widget(p.name, widget)
                 if p.name == "avg_len" and getattr(reader_rx_item, "avg_len_auto", None) is not None:
                     self._add_avg_auto_row(reader_rx_item, widget, not p.basic)
                 self._add_param_row(p.label or p.name, widget, not p.basic)
@@ -2830,6 +3154,7 @@ class NodeInspector(QtWidgets.QWidget):
         self.modulation_label.setVisible(False)
         self.modulation_combo.setVisible(False)
         self.wake_range_checkbox.setVisible(False)
+        self.wake_margin_row.setVisible(False)
         self._wake_range_owner = None
         self._decode_range_owner = None
         self.payload_mode_label.setVisible(False)
@@ -2859,6 +3184,9 @@ class NodeInspector(QtWidgets.QWidget):
             widget = make_param_widget(
                 p.name, edge_item.channel_params.get(p.name, p.default),
                 self._on_channel_param_changed)
+            if p.name in LEAK_TOOLTIPS:
+                widget.setToolTip(LEAK_TOOLTIPS[p.name])
+            _shape_special_widget(p.name, widget)
             if not advanced_toggle_inserted and not p.basic:
                 self._insert_advanced_toggle_row()
                 advanced_toggle_inserted = True
@@ -2866,6 +3194,28 @@ class NodeInspector(QtWidgets.QWidget):
             self.param_widgets[p.name] = widget
         if not advanced_toggle_inserted:
             self._insert_advanced_toggle_row()
+        self._update_fading_field_states()
+
+        # Polarization loss: UI-only link setting (POL_LOSS_KEY), shown
+        # with the other advanced antenna settings.
+        pol_spin = NoScrollDoubleSpinBox()
+        pol_spin.setRange(0.0, 40.0)
+        pol_spin.setSingleStep(0.5)
+        pol_spin.setDecimals(1)
+        pol_spin.setSuffix(" dB")
+        pol_spin.setValue(float(edge_item.channel_params.get(POL_LOSS_KEY, 0.0) or 0.0))
+        pol_spin.setToolTip(
+            "Loss from the two antennas on this link not being lined up (polarization\n"
+            "mismatch). 0 = perfectly aligned (the old behaviour).\n"
+            "Typical: circular reader antenna + linear tag antenna = ~3 dB, whichever\n"
+            "way the tag faces; link-budget papers use 2.2 dB per link (Sheikh 2019).\n"
+            "Tilted or crossed linear antennas can lose much more.\n"
+            "Acts like lowering this link's antenna gain by the same amount: the channel\n"
+            "block, the range rings and the energy estimate all use (gains - this).\n"
+            "On a reader it applies to both directions (same antennas).")
+        pol_spin.valueChanged.connect(lambda v: self._on_channel_param_changed(POL_LOSS_KEY, float(v)))
+        self._add_param_row("Polarization Loss (dB)", pol_spin, True)
+        self.param_widgets[POL_LOSS_KEY] = pol_spin
 
         # Interference_In is deliberately not surfaced at all -- nothing
         # wires it on a per-edge channel (TopologyMiddleware zero-sources
@@ -3050,6 +3400,7 @@ class NodeInspector(QtWidgets.QWidget):
                                       "'Auto' above to set it by hand.\n\n" + _AVG_AUTO_TOOLTIP)
         else:
             avg_len_widget.setToolTip(_AVG_AUTO_TOOLTIP)
+        self.window._update_wake_ranges()  # decode ring includes the averaging gain
 
     def _add_decode_range_controls(self, receiver_item):
         """Builds the "Show decode range" checkbox + "Decode SNR
@@ -3104,6 +3455,22 @@ class NodeInspector(QtWidgets.QWidget):
         )
         threshold_spin.valueChanged.connect(self._on_decode_threshold_changed)
         self.params_form.addRow(threshold_label, threshold_spin)
+
+        margin_label = QtWidgets.QLabel("Decode ring fade margin (dB)")
+        margin_spin = NoScrollDoubleSpinBox()
+        margin_spin.setRange(0.0, 40.0)
+        margin_spin.setDecimals(1)
+        margin_spin.setSingleStep(0.5)
+        margin_spin.setValue(float(receiver_item.ring_fade_margin_db or 0.0))
+        margin_spin.setToolTip(
+            "Shrinks the ring(s) to leave room for fading: the link must have this many dB to spare.\\n"
+            "0 = no margin. Link budgets typically reserve ~6 dB indoors (line of sight) and\\n"
+            "~15 dB outdoors (Sheikh 2019, for links that work 95% of the time).\\n"
+            "Only changes the ring -- the simulation itself is not affected." + "\n\n"
+            "The decode ring also includes this receiver's averaging gain "
+            "(+10*log10(length) dB) whenever 'Enable Receiver Averaging' is ticked.")
+        margin_spin.valueChanged.connect(self._on_decode_margin_changed)
+        self.params_form.addRow(margin_label, margin_spin)
 
     def _add_section_header(self, text):
         """Adds one bold, centered section-header row to params_form
@@ -3177,6 +3544,16 @@ class NodeInspector(QtWidgets.QWidget):
             self._decode_range_owner.show_decode_range = checked
             self.window._update_wake_ranges()
 
+    def _on_decode_margin_changed(self, value):
+        if self._decode_range_owner is not None:
+            self._decode_range_owner.ring_fade_margin_db = float(value)
+            self.window._update_wake_ranges()
+
+    def _on_wake_margin_changed(self, value):
+        if self._wake_range_owner is not None:
+            self._wake_range_owner.ring_fade_margin_db = float(value)
+            self.window._update_wake_ranges()
+
     def _on_decode_threshold_changed(self, value):
         if self._decode_range_owner is not None:
             self._decode_range_owner.decode_snr_threshold_db = value
@@ -3196,10 +3573,38 @@ class NodeInspector(QtWidgets.QWidget):
             # for a non-tag node (that label isn't even visible then).
             self._update_energy_info_label()
 
+    # fading_type_c1 index -> which fading settings apply
+    _FADING_NONE, _FADING_RICIAN, _FADING_RAYLEIGH = 0, 1, 2
+
+    def _update_fading_field_states(self):
+        """Grey out fading settings that the chosen Fading Model ignores:
+        K only matters for Rician; fade speed and seed only when there is
+        fading at all. Greyed, not hidden, so the panel doesn't jump."""
+        if self.current_edge is None or self.current_edge.channel_params is None:
+            return
+        ftype = int(self.current_edge.channel_params.get("fading_type_c1", 0) or 0)
+        rules = {
+            "rician_k": (ftype == self._FADING_RICIAN,
+                         "Only used with the Rician fading model."),
+            "doppler_hz": (ftype != self._FADING_NONE,
+                           "Only used when a fading model is selected."),
+            "fade_seed": (ftype != self._FADING_NONE,
+                          "Only used when a fading model is selected."),
+        }
+        for name, (enabled, why) in rules.items():
+            widget = self.param_widgets.get(name)
+            if widget is None:
+                continue
+            widget.setEnabled(enabled)
+            base = LEAK_TOOLTIPS.get(name, "")
+            widget.setToolTip(base if enabled else (why + ("\n\n" + base if base else "")))
+
     def _on_channel_param_changed(self, name, value):
         if self.current_edge is None or self.current_edge.channel_params is None:
             return
         self.current_edge.channel_params[name] = value
+        if name == "fading_type_c1":
+            self._update_fading_field_states()
         # A combined reader's hidden return leg (reader_shadow) is the
         # SAME physical path as this visible edge. update_edges_for_node()
         # only copied settings across on a drag, so editing e.g. noise,
@@ -3475,6 +3880,18 @@ class NodeInspector(QtWidgets.QWidget):
         self.packets_per_wake_spin.blockSignals(True)
         self.packets_per_wake_spin.setValue(tag_item.packets_per_wake)
         self.packets_per_wake_spin.blockSignals(False)
+        # The spin box repeats the WHOLE message: in Text/File mode one
+        # message is several fragments (one packet each), so "Packets to
+        # Send = 4" really meant 4 x (fragment count) packets -- misleading.
+        # Say what it is, and show the real packet total.
+        n_frags = max(1, round(cycle_bits / max(1, preamble_len + tag_item.effective_fragment_bits())))
+        if tag_item.payload_mode in ("text", "file"):
+            total = n_frags * tag_item.packets_per_wake
+            self.packets_per_wake_label.setText(
+                f"Times to Send Message  (= {total} packets: "
+                f"{n_frags} fragment{'s' if n_frags != 1 else ''} x {tag_item.packets_per_wake})")
+        else:
+            self.packets_per_wake_label.setText("Packets to Send")
         self.packets_per_wake_label.setToolTip(
             f"One full on-air cycle (preamble + payload, repeated per fragment "
             f"in Text/File mode) is {cycle_bits} bit(s) at this tag's own "
@@ -3623,7 +4040,7 @@ class NodeInspector(QtWidgets.QWidget):
             tx_power_send = sender.params.get("tx_power_send")
             freq = fwd_edge.channel_params.get("freq")
             g_reader_dbi = fwd_edge.channel_params.get("g_reader_dbi")
-            g_tag_dbi = fwd_edge.channel_params.get("g_tag_dbi")
+            g_tag_dbi = _effective_g_tag_dbi(fwd_edge.channel_params)  # minus polarization loss
             distance = fwd_edge.channel_params.get("distance")
             p_th = node.params.get("p_th")
             if tx_power_send is None or not freq or distance is None:
@@ -3778,8 +4195,24 @@ class CanvasWindow(QtWidgets.QMainWindow):
         self.save_button = QtWidgets.QPushButton("Save...")
         self.load_button = QtWidgets.QPushButton("Load...")
         self.save_default_button = QtWidgets.QPushButton("Save as Default")
+        # calibration-plan item 8: every channel has its own fading seed
+        # (Advanced -> "Fading Seed"). Ticked (default): runs reuse those
+        # seeds, so a run can be repeated exactly. Unticked: each Start
+        # gives every channel a fresh seed and KEEPS it -- tick again to
+        # replay that run. A reader's two hidden legs always share a seed.
+        self.same_fades_checkbox = QtWidgets.QCheckBox("Same fades every run")
+        self.same_fades_checkbox.setChecked(True)
+        self.same_fades_checkbox.setToolTip(
+            "Only matters when a channel's Fading Model is Rician or Rayleigh.\n"
+            "Ticked: every Start reuses each channel's Fading Seed, so the fades are\n"
+            "identical run to run (good for comparing settings).\n"
+            "Unticked: every Start picks a new random seed for every channel and keeps\n"
+            "it (good for averaging over many fades). Tick it again to repeat the last run.\n"
+            "New channels always get their own random seed; a reader's forward and\n"
+            "return legs always share one, since they are the same physical path.")
         self.stop_button.setEnabled(False)
-        for b in (self.validate_button, self.start_button, self.stop_button, self.autowire_button,
+        for b in (self.validate_button, self.start_button, self.stop_button, self.same_fades_checkbox,
+                  self.autowire_button,
                   self.copy_button, self.paste_button,
                   self.clear_button, self.save_button, self.load_button, self.save_default_button):
             toolbar.addWidget(b)
@@ -3883,6 +4316,7 @@ class CanvasWindow(QtWidgets.QMainWindow):
                  energy_switch_mode=None, energy_c_gate_fF=None, energy_vdd=None,
                  energy_r_bias_ohm=None, energy_duty_cycle=None,
                  decode_snr_threshold_db=None,
+                 ring_fade_margin_db=None,
                  add_to_scene=True, icon_type_name=None):
         """add_to_scene=False registers the NodeItem in self.nodes
         without scene().addItem() -- used only for a reader's hidden rx
@@ -3997,9 +4431,13 @@ class CanvasWindow(QtWidgets.QMainWindow):
         # __init__'s show_decode_range comment for why).
         if decode_snr_threshold_db is not None and type_name.startswith("rx_"):
             item.decode_snr_threshold_db = decode_snr_threshold_db
+        if ring_fade_margin_db is not None:
+            item.ring_fade_margin_db = float(ring_fade_margin_db)
         if add_to_scene:
             self.view.scene().addItem(item)
         self.nodes[node_id] = item
+        if add_to_scene:
+            self.view.update_scene_bounds()
         self.status.showMessage(f"Added {type_name} as '{node_id}'", 3000)
         return item
 
@@ -4082,6 +4520,13 @@ class CanvasWindow(QtWidgets.QMainWindow):
             return
         shadow = EdgeItem(tag, out_port, rx, in_port)
         shadow.is_reader_shadow = True
+        # A reader's forward and return legs are the same physical path
+        # (one antenna, same air), so they must fade TOGETHER: same seed.
+        # Later edits to the forward leg's seed are mirrored here by
+        # _on_channel_param_changed() like every other channel setting.
+        if forward_edge.channel_params is not None and shadow.channel_params is not None:
+            shadow.channel_params["fade_seed"] = forward_edge.channel_params.get(
+                "fade_seed", shadow.channel_params["fade_seed"])
         self.edges.append(shadow)  # deliberately never scene().addItem()'d -- see docstring
         forward_edge.reader_shadow = shadow
         if tag.out_ports:
@@ -4187,6 +4632,7 @@ class CanvasWindow(QtWidgets.QMainWindow):
                         if edge.reader_shadow is not None:
                             edge.reader_shadow.channel_params.update(edge.channel_params)
         self._update_wake_ranges()
+        self.view.update_scene_bounds()
         # No position-lock needed here any more: a combined reader is ONE
         # visible node now (see add_reader()) -- its hidden rx half is
         # never added to the scene, so nothing can ever drag it
@@ -4245,7 +4691,7 @@ class CanvasWindow(QtWidgets.QMainWindow):
             tx_power_send = sender.params.get("tx_power_send")
             freq = edge.channel_params.get("freq")
             g_reader_dbi = edge.channel_params.get("g_reader_dbi")
-            g_tag_dbi = edge.channel_params.get("g_tag_dbi")
+            g_tag_dbi = _effective_g_tag_dbi(edge.channel_params)  # minus polarization loss
             color = _tag_identity_color(tag.order_seq)
             border_color = QtGui.QColor(color)
             border_color.setAlpha(220)
@@ -4253,6 +4699,9 @@ class CanvasWindow(QtWidgets.QMainWindow):
 
             if sender.show_wake_ranges:
                 p_th = tag.params.get("p_th")
+                if p_th is not None:
+                    # fade margin: the tag must harvest margin-dB more than p_th
+                    p_th = float(p_th) * 10 ** (float(sender.ring_fade_margin_db or 0.0) / 10.0)
                 radius_m = (
                     _wake_up_radius_m(float(tx_power_send), float(p_th), float(freq),
                                        float(g_reader_dbi), float(g_tag_dbi),
@@ -4352,7 +4801,7 @@ class CanvasWindow(QtWidgets.QMainWindow):
             gamma1_phase_deg = tag.params.get("gamma1_phase_deg")
             ret_freq = ret_edge.channel_params.get("freq")
             ret_g_reader_dbi = ret_edge.channel_params.get("g_reader_dbi")
-            ret_g_tag_dbi = ret_edge.channel_params.get("g_tag_dbi")
+            ret_g_tag_dbi = _effective_g_tag_dbi(ret_edge.channel_params)
             ret_noise_volt_c1 = ret_edge.channel_params.get("noise_volt_c1")
             if (tx_power_send is None or not freq or gamma0_mag is None
                     or gamma1_mag is None or not ret_freq or ret_noise_volt_c1 is None):
@@ -4367,7 +4816,12 @@ class CanvasWindow(QtWidgets.QMainWindow):
             # decode" SNR genuinely differs by modulation/detector, so
             # it's a value the user calibrates against their own
             # measured BER, not a universal truth.
-            snr_threshold_db = receiver.decode_snr_threshold_db
+            # + this receiver's fade margin, - the averaging gain when its
+            # averaging is ticked (the ring's SNR is per-sample; averaging L
+            # samples cuts noise by 10*log10(L) dB, same as the BER plot)
+            snr_threshold_db = (receiver.decode_snr_threshold_db
+                                + float(receiver.ring_fade_margin_db or 0.0)
+                                - _rx_avg_gain_db(receiver, tag.params.get("bit_rate")))
             decode_radius_m = _decode_range_m(
                 float(tx_power_send),
                 float(freq), float(g_reader_dbi), float(g_tag_dbi),
@@ -4658,6 +5112,7 @@ class CanvasWindow(QtWidgets.QMainWindow):
             "energy_static_rate": node.energy_static_rate,
             "decode_snr_threshold_db": (
                 node.decode_snr_threshold_db if node.type_name.startswith("rx_") else None),
+            "ring_fade_margin_db": node.ring_fade_margin_db,
             "forward_from": fwd_edge.from_node if fwd_edge is not None else None,
             "forward_channel_params": dict(fwd_edge.channel_params) if fwd_edge is not None else None,
             "return_to": ret_edge.to_node if ret_edge is not None else None,
@@ -4693,7 +5148,8 @@ class CanvasWindow(QtWidgets.QMainWindow):
                                   energy_r_bias_ohm=clip.get("energy_r_bias_ohm"),
                                   energy_duty_cycle=clip.get("energy_duty_cycle"),
                                   energy_static_rate=clip.get("energy_static_rate"),
-                                  decode_snr_threshold_db=clip.get("decode_snr_threshold_db"))
+                                  decode_snr_threshold_db=clip.get("decode_snr_threshold_db"),
+                                  ring_fade_margin_db=clip.get("ring_fade_margin_db"))
 
         # Recreate the same wiring the original tag had, to the SAME
         # sender/receiver (not a copy of them) -- only if that node is
@@ -4711,14 +5167,16 @@ class CanvasWindow(QtWidgets.QMainWindow):
                 # (EdgeItem.__init__ -> sync_distance_from_position()),
                 # which is the whole point: paste it somewhere, that
                 # position IS its distance, same as any other edge.
-                other = {k: v for k, v in clip["forward_channel_params"].items() if k != "distance"}
+                other = {k: v for k, v in clip["forward_channel_params"].items()
+                         if k not in CHANNEL_IDENTITY_PARAMS}  # pasted tag = new paths: own distance, own fades
                 edge.channel_params.update(other)
             wired += 1
         rx = clip["return_to"]
         if rx is not None and rx in self.nodes.values() and rx.in_ports and new_node.out_ports:
             edge = self.add_edge(new_node, new_node.out_ports[0].name, rx, rx.in_ports[0].name)
             if edge is not None and clip["return_channel_params"] is not None:
-                other = {k: v for k, v in clip["return_channel_params"].items() if k != "distance"}
+                other = {k: v for k, v in clip["return_channel_params"].items()
+                         if k not in CHANNEL_IDENTITY_PARAMS}
                 edge.channel_params.update(other)
             wired += 1
 
@@ -4742,6 +5200,8 @@ class CanvasWindow(QtWidgets.QMainWindow):
             self.copy_selected()
         elif ctrl and event.key() == QtCore.Qt.Key.Key_V:
             self.paste_clipboard()
+        elif ctrl and event.key() == QtCore.Qt.Key.Key_0:
+            self.view.fit_all()
         else:
             super().keyPressEvent(event)
 
@@ -4882,7 +5342,29 @@ class CanvasWindow(QtWidgets.QMainWindow):
         center = node_item.pos() + QtCore.QPointF(rect.width() / 2, rect.height() / 2)
         was_selected = node_item.isSelected()
 
-        pending_edges = []  # (role, this_node's_old_port, other_node, other_port)
+        pending_edges = []  # (role, this_node's_old_port, other_node, other_port, link_state)
+        # Channel settings live on the EDGE (noise, freq, gains, path-loss
+        # exponent, phase, ...), and every edge touching this node is about
+        # to be deleted and rebuilt by add_edge(), which seeds fresh
+        # defaults. Snapshot each edge's settings (and a reader's hidden
+        # return leg's) so they survive a modulation switch -- a switch
+        # changes the tag/receiver, not the air between them.
+        def _link_state(edge):
+            shadow = getattr(edge, "reader_shadow", None)
+            return {
+                "role": edge.role,
+                "channel_params": dict(edge.channel_params) if edge.channel_params is not None else None,
+                "probes": set(getattr(edge, "signal_probe_ports", set())),
+                "shadow_params": (dict(shadow.channel_params)
+                                  if shadow is not None and shadow.channel_params is not None else None),
+            }
+        # A reader's rx being switched: its forward edge is untouched but
+        # its hidden return leg gets re-derived below -- keep that leg's
+        # settings too.
+        reader_shadow_params = {}
+        for e in self.edges:
+            if e.is_reader_shadow and e.to_node is node_item and e.channel_params is not None:
+                reader_shadow_params[e.from_node] = dict(e.channel_params)
         for e in self.edges:
             if e.is_reader_shadow:
                 # Deliberately NOT queued for the generic recreate-via-add_edge()
@@ -4895,9 +5377,9 @@ class CanvasWindow(QtWidgets.QMainWindow):
                 # the forward edge at all, and is handled explicitly below.
                 continue
             if e.from_node is node_item:
-                pending_edges.append(("out", e.from_port_name, e.to_node, e.to_port_name))
+                pending_edges.append(("out", e.from_port_name, e.to_node, e.to_port_name, _link_state(e)))
             elif e.to_node is node_item:
-                pending_edges.append(("in", e.to_port_name, e.from_node, e.from_port_name))
+                pending_edges.append(("in", e.to_port_name, e.from_node, e.from_port_name, _link_state(e)))
 
         # reader_partner: None for a tag (tags are never a reader's own
         # sender/rx half, see add_reader()) -- captured before the
@@ -4940,19 +5422,41 @@ class CanvasWindow(QtWidgets.QMainWindow):
                         if e.role == "forward" and e.from_node is reader_partner), None)
             if fwd is not None:
                 self._wire_reader_shadow_return(fwd)
+                shadow = fwd.reader_shadow
+                saved = reader_shadow_params.get(fwd.to_node)
+                if shadow is not None and saved is not None and shadow.channel_params is not None:
+                    shadow.channel_params.update(saved)
         if was_selected:
             new_item.setSelected(True)
 
         dropped = []
-        for role, old_port, other_node, other_port in pending_edges:
+        for role, old_port, other_node, other_port, state in pending_edges:
             new_port = rename.get(old_port)
             if new_port is None:
                 dropped.append(f"{old_port} -> {other_node.node_id}.{other_port}")
                 continue
             if role == "out":
-                self.add_edge(new_item, new_port, other_node, other_port)
+                edge = self.add_edge(new_item, new_port, other_node, other_port)
             else:
-                self.add_edge(other_node, other_port, new_item, new_port)
+                edge = self.add_edge(other_node, other_port, new_item, new_port)
+            if edge is None:
+                continue
+            # put the link's own settings back (see _link_state above);
+            # only same-role links, so a link whose meaning changed keeps
+            # its fresh defaults
+            if (state["channel_params"] is not None and edge.channel_params is not None
+                    and edge.role == state["role"]):
+                edge.channel_params.update(state["channel_params"])
+            if hasattr(edge, "signal_probe_ports"):
+                edge.signal_probe_ports |= state["probes"]
+            # add_edge() may have re-derived a reader's hidden return leg
+            # (and even re-switched the reader's rx, which re-derives it
+            # again) -- fwd.reader_shadow is always the current one
+            shadow = getattr(edge, "reader_shadow", None)
+            if (shadow is not None and state["shadow_params"] is not None
+                    and shadow.channel_params is not None):
+                shadow.channel_params.update(state["shadow_params"])
+        self._update_wake_ranges()
 
         msg = f"'{node_id}' switched to {new_modulation} ({new_type_name})."
         if dropped:
@@ -5137,7 +5641,21 @@ class CanvasWindow(QtWidgets.QMainWindow):
         if notify and changed and self.inspector.current_node is rx_item:
             self.inspector.show_node(rx_item)
 
+    def _sync_tag_tari_from_senders(self):
+        """Every tag's command detector must use the SAME Tari as the
+        sender (or reader) that commands it, so the tag's own "tari" is
+        never typed: it is copied from the sender on its forward edge,
+        at every Start and whenever a tag's panel opens. (It used to be
+        hard-coded 12.5 inside every tag block, so changing the sender's
+        Tari silently stopped tags from waking.) A tag with no sender
+        wired keeps whatever it has (12.5 by default)."""
+        for e in self.edges:
+            if (e.role == "forward" and "tari" in e.to_node.params
+                    and "tari" in e.from_node.params):
+                e.to_node.params["tari"] = float(e.from_node.params["tari"])
+
     def scene_to_topology(self):
+        self._sync_tag_tari_from_senders()
         nodes = []
         node_dicts = {}  # node_id -> the dict just appended to `nodes`,
                           # so the receivers loop below can attach
@@ -5181,7 +5699,8 @@ class CanvasWindow(QtWidgets.QMainWindow):
             # currently building, which is exactly when on_start() calls
             # this method.
             e.live_channel_id = channel_id
-            nodes.append({"id": channel_id, "type": "channel", "params": dict(e.channel_params)})
+            nodes.append({"id": channel_id, "type": "channel",
+                          "params": _effective_channel_params(e.channel_params)})  # polarization loss folded in
             edges.append((e.from_node.node_id, e.from_port_name, channel_id, "Signal_In"))
             edges.append((channel_id, "out", e.to_node.node_id, e.to_port_name))
 
@@ -5226,6 +5745,15 @@ class CanvasWindow(QtWidgets.QMainWindow):
             # is what makes sure what actually gets built here is never
             # a stale value the inspector just hadn't refreshed yet.
             self._sync_decoder_params(rx, upstream_tags)
+            # The sync can also change the RECEIVER's own params (FM0/
+            # Miller: payload_len, bit_rate), but this receiver's node dict
+            # was copied from rx.params at the top of this function, BEFORE
+            # the sync -- so the block was built with the stale values and
+            # only the next Start caught up. Measured (2026-11-16): a freshly
+            # dropped rx_fm0 went out with payload_len 5 while its decoder got
+            # 80, and the first Start decoded nothing. Refresh the copy.
+            if rx.node_id in node_dicts:
+                node_dicts[rx.node_id]["params"] = dict(rx.params)
 
             decoder_id = f"decoder_{rx.node_id}"
             params = dict(rx.decoder_params)
@@ -5311,6 +5839,8 @@ class CanvasWindow(QtWidgets.QMainWindow):
                 # view toggle -- losing it on every Save/Load would
                 # throw away real experiment setup.
                 n["decode_snr_threshold_db"] = item.decode_snr_threshold_db
+            if item.type_name == "sender" or item.type_name.startswith("rx_"):
+                n["ring_fade_margin_db"] = item.ring_fade_margin_db
             if item.reader_partner is not None:
                 # See add_reader()/NodeItem.reader_partner -- just the
                 # OTHER node's id. The hidden rx half's position is
@@ -5346,9 +5876,12 @@ class CanvasWindow(QtWidgets.QMainWindow):
             else:
                 edges.append([e.from_node.node_id, e.from_port_name,
                               e.to_node.node_id, e.to_port_name])
-        return {"nodes": nodes, "edges": edges}
+        return {"nodes": nodes, "edges": edges,
+                "same_fades_each_run": self.same_fades_checkbox.isChecked()}
 
     def _load_layout_dict(self, data):
+        # older layouts have no such key -> keep the default (ticked)
+        self.same_fades_checkbox.setChecked(bool(data.get("same_fades_each_run", True)))
         self.view.scene().clear()
         self.nodes = {}
         self.edges = []
@@ -5400,6 +5933,7 @@ class CanvasWindow(QtWidgets.QMainWindow):
                 energy_duty_cycle=n.get("energy_duty_cycle"),
                 energy_static_rate=n.get("energy_static_rate"),
                 decode_snr_threshold_db=n.get("decode_snr_threshold_db"),
+                ring_fade_margin_db=n.get("ring_fade_margin_db"),  # older layouts: 0
                 icon_type_name=icon_type_name,
             )
 
@@ -5441,6 +5975,16 @@ class CanvasWindow(QtWidgets.QMainWindow):
                 edge = self.add_edge(self.nodes[from_id], from_port, self.nodes[to_id], to_port)
                 if edge is not None and channel_params and edge.channel_params is not None:
                     edge.channel_params.update(channel_params)
+                    # A reader's hidden return leg isn't saved on its own:
+                    # it mirrors the one visible link. Copy the loaded
+                    # settings onto it now, the same way moving a node does
+                    # (update_edges_for_node). Before, a loaded reader ran
+                    # its return leg on DEFAULT noise/freq/gains/... until
+                    # something was moved -- and with fade seeds, would
+                    # also have faded separately from its forward leg.
+                    shadow = getattr(edge, "reader_shadow", None)
+                    if shadow is not None and shadow.channel_params is not None:
+                        shadow.channel_params.update(edge.channel_params)
 
     def _confirm_discard_if_nonempty(self):
         if not self.nodes:
@@ -5504,14 +6048,33 @@ class CanvasWindow(QtWidgets.QMainWindow):
             f"{len(nodes)} node(s), {len(edges)} connection(s), "
             f"{len(plan['fanin_groups'])} fan-in group(s) -- wiring resolves cleanly.\n\n"
             "Note: this checks that every named port exists and resolves to a real "
-            "position, plus the one specific known trap in _check_known_requirements() "
-            "(every rx_*'s Tx_Leakage_In). It does NOT check that every OTHER required "
-            "input has something feeding it, or that connected ports agree on data "
-            "type (complex/byte/float) -- those still only surface on Start, from "
-            "gnuradio's own flowgraph validation."
+            "position, plus the known traps in _check_known_requirements(): a sender "
+            "exists for every receiver, every tag is linked from a sender and to a "
+            "receiver, and every receiver has a tag linked to it. It does NOT check "
+            "that connected ports agree on data type (complex/byte/float) -- if "
+            "gnuradio still rejects something on Start, Start shows its message "
+            "instead of crashing."
         )
 
+    def _reseed_all_fades(self):
+        """New random fading seed for every channel (the "Same fades every
+        run" tick is off). A reader's hidden return leg takes its forward
+        leg's new seed, so the shared-path rule still holds."""
+        for e in self.edges:
+            if e.channel_params is not None and not e.is_reader_shadow:
+                e.channel_params["fade_seed"] = _new_fade_seed()
+        for e in self.edges:
+            shadow = getattr(e, "reader_shadow", None)
+            if shadow is not None and e.channel_params is not None and shadow.channel_params is not None:
+                shadow.channel_params["fade_seed"] = e.channel_params["fade_seed"]
+        # refresh an open channel panel so it shows the new seed
+        current = getattr(self.inspector, "current_edge", None)
+        if current is not None:
+            self.inspector.show_edge(current)
+
     def on_start(self):
+        if not self.same_fades_checkbox.isChecked():
+            self._reseed_all_fades()
         nodes, edges = self.scene_to_topology()
         problems = _check_known_requirements(nodes, edges)
         if problems:
@@ -5529,7 +6092,29 @@ class CanvasWindow(QtWidgets.QMainWindow):
         # ordering is what actually fixes the freeze/stutter opening one
         # mid-run used to cause.
         self._open_pending_signal_views()
-        self.mw.start()
+        try:
+            self.mw.start()
+        except Exception as e:
+            # Safety net for anything _check_known_requirements() doesn't
+            # know about yet: gnuradio's own flowgraph validation raises
+            # from tb.start(), and an uncaught exception inside a Qt slot
+            # takes the whole app down (PyQt6 aborts). Undo what was set
+            # up above and show the message instead.
+            if self._signal_view_window is not None:
+                self._signal_view_window.close()
+            try:
+                self.mw.stop()
+            except Exception:
+                pass
+            self.mw = None
+            QtWidgets.QMessageBox.warning(
+                self, "Can't start",
+                "GNU Radio refused to start this layout:\n\n"
+                f"{e}\n\n"
+                "This usually means a block has a port with nothing linked to it. "
+                "Check that every tag is linked from a sender and to a receiver."
+            )
+            return
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.validate_button.setEnabled(False)
@@ -5864,6 +6449,31 @@ class CanvasWindow(QtWidgets.QMainWindow):
             # whatever order dict iteration happened to produce.
             self.decoder_docks[f"decoder_{receivers[0].node_id}"].raise_()
 
+    def _best_match_packet_ber(self, rx_item, tag_items, pkt):
+        """(n_wrong, n_bits) against the closest fragment any upstream tag
+        sent this run, or None if nothing comparable exists. Fragments of a
+        tag are fixed-size (preamble + n_bits each, see message_framer)."""
+        preamble_len = len(rx_item.decoder_params.get("preamble") or PREAMBLE)
+        n_bits = pkt["bits"]
+        if n_bits <= 0:
+            return None
+        decoded_bits = _hex_str_to_bits(pkt["hex"], n_bits)
+        if len(decoded_bits) != n_bits:
+            return None
+        block_size = preamble_len + n_bits
+        best = None
+        for tag in tag_items:
+            frame_bits = self.mw.tag_frame_bits.get(tag.node_id)
+            if not frame_bits or len(frame_bits) % block_size != 0:
+                continue
+            for k in range(len(frame_bits) // block_size):
+                start = k * block_size + preamble_len
+                expected = frame_bits[start:start + n_bits]
+                n_wrong = sum(1 for a, b in zip(expected, decoded_bits) if a != b)
+                if best is None or n_wrong < best:
+                    best = n_wrong
+        return None if best is None else (best, n_bits)
+
     def _compute_packet_ber(self, decoder_id, pkt):
         """Bit-error count for one decoded packet, against the EXACT
         bits that tag actually transmitted this run (TopologyMiddleware.
@@ -5892,6 +6502,15 @@ class CanvasWindow(QtWidgets.QMainWindow):
 
         sim_header = pkt.get("sim_header")
         tag_items = self._find_upstream_tags(rx_item)
+        if sim_header is not None and not sim_header.get("crc_ok", True):
+            # Damaged packet: its header's tag_id/frag_index can't be
+            # trusted. Looking up the expected bits by a flipped frag_index
+            # compared the packet against the WRONG fragment (measured: one
+            # real bit error in frag_index showed as 17/88). Instead compare
+            # against every fragment every upstream tag actually sent and
+            # keep the closest. (Not "--": that would drop exactly the
+            # error-carrying packets from the cumulative BER.)
+            return self._best_match_packet_ber(rx_item, tag_items, pkt)
         if sim_header is not None:
             idx = sim_header["tag_id"]
             if idx < 0 or idx >= len(tag_items):
@@ -6161,11 +6780,11 @@ class CanvasWindow(QtWidgets.QMainWindow):
             "tx_power_send": sender.params.get("tx_power_send"),
             "fwd_freq": fwd.get("freq"),
             "fwd_g_reader_dbi": fwd.get("g_reader_dbi"),
-            "fwd_g_tag_dbi": fwd.get("g_tag_dbi"),
+            "fwd_g_tag_dbi": _effective_g_tag_dbi(fwd),  # minus polarization loss
             "fwd_distance_m": fwd.get("distance"),
             "ret_freq": ret.get("freq"),
             "ret_g_reader_dbi": ret.get("g_reader_dbi"),
-            "ret_g_tag_dbi": ret.get("g_tag_dbi"),
+            "ret_g_tag_dbi": _effective_g_tag_dbi(ret),
             "ret_noise_volt_c1": ret.get("noise_volt_c1"),
             "ret_distance_m": ret.get("distance"),
             # path-loss exponent per leg (absent on layouts saved before

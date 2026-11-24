@@ -48,7 +48,7 @@ bytes.fromhex(), with no bit-shifting required on this side either:
                              one receiver. Covering the header closes that:
                              any header corruption now fails the same CRC
                              check the chunk already relied on.)
-    bytes 7..: chunk        (chunk_bytes of message data, zero-padded)
+    bytes 7..: chunk        (chunk_bytes of message data, padded with _PAD_BYTE)
 
 Revision (2026-11-02): frag_index/frag_count widened from 1 byte each to
 2 bytes each (HEADER_BYTES 5 -> 7, MAX_FRAGMENTS 255 -> 65535) -- the old
@@ -157,6 +157,20 @@ MAX_FRAGMENTS = 65535
 # docstring and test_header_whitening.py for the exhaustive check.
 _SCRAMBLE_BYTE = 0x33
 
+# Filler for the unused bytes of a message's LAST fragment (2026-11-13).
+# Was 0x00: e.g. "Hello" in 4-byte fragments ends in 3 zero bytes = 24
+# zero bits in a row, which the receiver's DC blocker (OOK/BPSK) reads as
+# a drifting average level, garbling that packet -- measured: the padded
+# packet decoded as garbage even at dc_len 2000, and fine with this
+# filler. 0x33 (00110011) never stays at one level for more than 2 bits,
+# and over 400 random messages gave the FEWEST accidental preamble copies
+# of the fillers checked (0x55 = 01010101 resembles the preamble 10101011
+# and gave ~70% more). The filler is never message content: used_bytes
+# tells the reassembler how many chunk bytes are real, and it drops the
+# rest whatever they contain. The CRC covers the padded chunk, so it is
+# computed over this filler exactly as it used to be over the zeros.
+_PAD_BYTE = 0x33
+
 
 def _scramble(data):
     """XOR every byte with _SCRAMBLE_BYTE -- its own inverse, so the
@@ -229,7 +243,7 @@ def parse_fragment_hex(hex_str):
           feed_parsed() treats False the same as every other
           malformed-fragment case (drops it); a display-only caller
           can still show it (e.g. "CRC fail") instead of hiding it.
-      "chunk": bytes -- exactly chunk_bytes long (zero-padded on the
+      "chunk": bytes -- exactly chunk_bytes long (padded with _PAD_BYTE on the
           final, shorter fragment); "used_bytes" says how many of it
           are real data, same meaning as the module docstring's byte 5.
     """
@@ -281,7 +295,8 @@ def build_fragments_from_bytes(data, tag_id, chunk_bytes):
     necessarily text) into chunk_bytes-sized pieces and returns a list
     of same-length bit-lists, one per fragment -- every fragment is
     exactly fragment_len_bits(chunk_bytes) long, the final one
-    zero-padded if the data didn't divide evenly (see "used_bytes" in
+    padded with _PAD_BYTE (0x33, not zeros -- see its comment) if the
+    data didn't divide evenly (see "used_bytes" in
     the module docstring for how a reassembler knows to drop that
     padding rather than keeping it).
 
@@ -297,7 +312,7 @@ def build_fragments_from_bytes(data, tag_id, chunk_bytes):
     -- a file's size is exactly as self-describing on the wire as a
     text message's: frag_count says how many fragments make up the
     whole thing, and the last fragment's used_bytes says how many of
-    ITS chunk_bytes are real data vs zero-padding. A reassembler never
+    ITS chunk_bytes are real data vs padding. A reassembler never
     needs to be told "how big" a message/file is up front -- it just
     waits until it has every index 0..frag_count-1, exactly the same
     way regardless of what payload mode produced the bytes.
@@ -325,7 +340,7 @@ def build_fragments_from_bytes(data, tag_id, chunk_bytes):
     fragments = []
     for frag_index, chunk in enumerate(chunks):
         used_bytes = len(chunk)
-        padded_chunk = chunk + b"\x00" * (chunk_bytes - used_bytes)
+        padded_chunk = chunk + bytes([_PAD_BYTE]) * (chunk_bytes - used_bytes)
         # frag_index/frag_count are 2-byte big-endian fields now (see the
         # module docstring's 2026-11-02 wire-widening note) -- tag_id/
         # used_bytes stay single bytes.

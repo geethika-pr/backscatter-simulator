@@ -24,7 +24,7 @@ import threading
 
 
 class backscatter_sender(gr.hier_block2):
-    def __init__(self, carrier_freq_send=0, command_bits=(0, 1, 0, 1), enable_gated=0, phase_noise_std_send=0, samp_rate_send=2e6, tari=12.5, tx_power_send=20):
+    def __init__(self, carrier_freq_send=0, command_bits=(0, 1, 0, 1), enable_gated=0, phase_noise_std_send=0, samp_rate_send=2e6, tari=12.5, tx_power_send=20, warmup_us=0):
         gr.hier_block2.__init__(
             self, "Sender",
                 gr.io_signature(0, 0, 0),
@@ -41,12 +41,13 @@ class backscatter_sender(gr.hier_block2):
         self.samp_rate_send = samp_rate_send
         self.tari = tari
         self.tx_power_send = tx_power_send
+        self.warmup_us = warmup_us
 
         ##################################################
         # Blocks
         ##################################################
 
-        self.epy_block_0 = epy_block_0.reader_pie_encoder(samp_rate=samp_rate_send, tari_us=tari, cmd_len=len(command_bits))
+        self.epy_block_0 = epy_block_0.reader_pie_encoder(samp_rate=samp_rate_send, tari_us=tari, cmd_len=len(command_bits), warmup_us=warmup_us)
         self.blocks_vector_source_x_0 = blocks.vector_source_b(command_bits, True, 1, [])
         self.blocks_selector_0 = blocks.selector(gr.sizeof_gr_complex*1,enable_gated,0)
         self.blocks_selector_0.set_enabled(True)
@@ -121,4 +122,10 @@ class backscatter_sender(gr.hier_block2):
     def set_tx_power_send(self, tx_power_send):
         self.tx_power_send = tx_power_send
         self.analog_sig_source_x_0.set_amplitude(self.tx_power_send)
+
+    def get_warmup_us(self):
+        return self.warmup_us
+
+    def set_warmup_us(self, warmup_us):
+        self.warmup_us = warmup_us
 

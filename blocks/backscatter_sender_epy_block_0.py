@@ -3,10 +3,11 @@ from gnuradio import gr
 
 class reader_pie_encoder(gr.basic_block):
     """
-    Encodes only the specified command sequence once, then outputs
-    continuous unmodulated carrier (1.0) indefinitely.
+    Outputs plain carrier for warmup_us (optional reader warm-up), then the
+    specified command sequence once, then continuous unmodulated carrier
+    (1.0) indefinitely.
     """
-    def __init__(self, samp_rate=2e6, tari_us=12.5, cmd_len=4):
+    def __init__(self, samp_rate=2e6, tari_us=12.5, cmd_len=4, warmup_us=0.0):
         gr.basic_block.__init__(
             self,
             name="Reader PIE Encoder",
@@ -17,6 +18,12 @@ class reader_pie_encoder(gr.basic_block):
         self.tari_samples = int(tari_us * 1e-6 * self.samp_rate)
         self.notch_samples = max(2, int(0.5 * self.tari_samples))
         self.cmd_len = int(cmd_len)
+        # Reader warm-up: plain carrier for this long BEFORE the command, the
+        # way a real reader powers the field up before talking to tags. Tags
+        # charge up during it, and the reader's own receiver (DC blocker)
+        # settles on its carrier leakage before any tag replies. 0 = off
+        # (command at the very first sample, the old behaviour).
+        self.warmup_samples = max(0, int(round(float(warmup_us) * 1e-6 * self.samp_rate)))
 
         self.burst_built = False
         self.burst_buf = []
@@ -30,7 +37,15 @@ class reader_pie_encoder(gr.basic_block):
 
         # 1. Build the PIE pulse sequence strictly for cmd_len bits once
         if not self.burst_built and n_in >= self.cmd_len:
-            buf = []
+            buf = [1.0 + 0.0j] * self.warmup_samples
+            if self.warmup_samples > 0:
+                # Delimiter: one short dip right after the warm-up, so the
+                # tag's command detector closes off the long plain-carrier
+                # stretch as a separate (ignored) symbol. Without it the
+                # warm-up merges into the first command bit, the tag reads
+                # e.g. 1101 instead of 0101, and never wakes (a real reader
+                # likewise starts every command with a delimiter).
+                buf.extend([0.05 + 0.0j] * self.notch_samples)
             # Slice strictly the first cmd_len bits (e.g. 4 bits)
             target_bits = in_bytes[:self.cmd_len]
             for bit in target_bits:

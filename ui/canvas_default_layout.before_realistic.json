@@ -1,0 +1,135 @@
+{
+  "nodes": [
+    {
+      "id": "sender1",
+      "type": "sender",
+      "x": 120.0,
+      "y": 160.0,
+      "params": {
+        "warmup_us": 10000.0,
+        "tari": 12.5,
+        "tx_power_send": 30,
+        "enable_gated": 1,
+        "command_bits": [
+          0,
+          1,
+          0,
+          1
+        ],
+        "carrier_freq_send": 0,
+        "phase_noise_std_send": 0,
+        "samp_rate_send": 2000000.0
+      },
+      "order_seq": 0
+    },
+    {
+      "id": "tag_ook1",
+      "type": "tag_ook",
+      "x": 643.5285877459673,
+      "y": -187.97754119396564,
+      "params": {
+        "slot_id": 0,
+        "packet_bits": 1152,
+        "bit_rate": 10000.0,
+        "enable_gated": 1,
+        "pie_bits": "0,1,0,1",
+        "p_th": 0.5,
+        "alpha": 0.01,
+        "as_real": 0.05,
+        "as_imag": 0.0,
+        "gamma0_mag": 0.1,
+        "gamma0_phase_deg": 180.0,
+        "gamma1_mag": 0.9,
+        "gamma1_phase_deg": 180.0,
+        "samp_rate": 2000000.0
+      },
+      "order_seq": 5,
+      "payload": [
+        1,
+        0,
+        1,
+        1,
+        0
+      ],
+      "tag_loss_db": 0.0,
+      "payload_mode": "text",
+      "message_text": "Hello",
+      "chunk_bytes": 4,
+      "file_name": "",
+      "file_bytes_hex": "",
+      "packets_per_wake": 6,
+      "energy_per_bit": 1.3500000000000003e-13,
+      "energy_switch_mode": "fet",
+      "energy_c_gate_fF": 15.0,
+      "energy_vdd": 3.0,
+      "energy_r_bias_ohm": 2000.0,
+      "energy_duty_cycle": 0.5,
+      "energy_static_rate": 0.0
+    },
+    {
+      "id": "rx_ook1",
+      "type": "rx_ook",
+      "x": 1182.0,
+      "y": 150.0,
+      "params": {
+        "si_enable": 0,
+        "dc_len": 500,
+        "si_isolation_db": 40.0,
+        "enable_avg": 1,
+        "avg_len": 100,
+        "samp_rate": 2000000.0
+      },
+      "order_seq": 6,
+      "avg_len_auto": true,
+      "decoder_params": {
+        "payload_len_bits": 88,
+        "bit_rate": 10000.0,
+        "preamble": "10101011",
+        "samp_rate": 2000000.0,
+        "accept_inverted": 1
+      },
+      "decode_snr_threshold_db": 6.0
+    }
+  ],
+  "edges": [
+    {
+      "from": "sender1",
+      "from_port": "Carrier_Out",
+      "to": "tag_ook1",
+      "to_port": "Carrier_In",
+      "channel_params": {
+        "distance": 1.0,
+        "fading_type_c1": 0,
+        "fade_seed": 3212999,
+        "noise_volt_c1": 0.02,
+        "freq": 915000000.0,
+        "g_reader_dbi": 6.0,
+        "g_tag_dbi": 2.0,
+        "path_loss_exp": 2.0,
+        "model_phase": 0,
+        "samp_rate_c1": 2000000.0,
+        "pol_loss_db": 0.0
+      }
+    },
+    {
+      "from": "tag_ook1",
+      "from_port": "out",
+      "to": "rx_ook1",
+      "to_port": "Antenna_In",
+      "channel_params": {
+        "distance": 1.0,
+        "fading_type_c1": 0,
+        "fade_seed": 6118847,
+        "noise_volt_c1": 0.01,
+        "freq": 915000000.0,
+        "g_reader_dbi": 6.0,
+        "g_tag_dbi": 2.0,
+        "path_loss_exp": 2.0,
+        "model_phase": 0,
+        "samp_rate_c1": 2000000.0,
+        "pol_loss_db": 0.0
+      }
+    }
+  ],
+  "same_fades_each_run": true
+}

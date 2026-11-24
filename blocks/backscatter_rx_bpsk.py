@@ -15,6 +15,7 @@ from gnuradio.filter import firdes
 from gnuradio.fft import window
 import sys
 import signal
+import cmath, math
 import threading
 
 
@@ -24,7 +25,7 @@ import threading
 
 
 class backscatter_rx_bpsk(gr.hier_block2):
-    def __init__(self, avg_len=100, dc_len=1024, enable_avg=1, loop_bandwidth=0.002, samp_rate=2e6, si_enable=1, si_isolation_db=25.0):
+    def __init__(self, avg_len=100, dc_len=1024, enable_avg=1, leak_phase_deg=180.0, loop_bandwidth=0.002, samp_rate=2e6, si_enable=1, si_isolation_db=25.0):
         gr.hier_block2.__init__(
             self, "Reciever BPSK (Backscatter)",
                 gr.io_signature.makev(2, 2, [gr.sizeof_gr_complex*1, gr.sizeof_gr_complex*1]),
@@ -37,6 +38,7 @@ class backscatter_rx_bpsk(gr.hier_block2):
         self.avg_len = avg_len
         self.dc_len = dc_len
         self.enable_avg = enable_avg
+        self.leak_phase_deg = leak_phase_deg
         self.loop_bandwidth = loop_bandwidth
         self.samp_rate = samp_rate
         self.si_enable = si_enable
@@ -51,7 +53,7 @@ class backscatter_rx_bpsk(gr.hier_block2):
         self.dc_blocker_xx_0 = filter.dc_blocker_cc(dc_len, True)
         self.blocks_selector_0 = blocks.selector(gr.sizeof_gr_complex*1,si_enable,0)
         self.blocks_selector_0.set_enabled(True)
-        self.blocks_multiply_const_vxx_0 = blocks.multiply_const_cc(-1.0 * (10.0 ** (-si_isolation_db / 20.0)))
+        self.blocks_multiply_const_vxx_0 = blocks.multiply_const_cc((10.0 ** (-si_isolation_db / 20.0)) * cmath.exp(1j * math.pi * leak_phase_deg / 180.0))
         self.blocks_moving_average_xx_0 = blocks.moving_average_ff(avg_len if enable_avg else 1, (1.0 / (avg_len if enable_avg else 1)), 4000, 1)
         self.blocks_complex_to_real_0 = blocks.complex_to_real(1)
         self.blocks_add_xx_0 = blocks.add_vcc(1)
@@ -93,6 +95,13 @@ class backscatter_rx_bpsk(gr.hier_block2):
         self.enable_avg = enable_avg
         self.blocks_moving_average_xx_0.set_length_and_scale(self.avg_len if self.enable_avg else 1, (1.0 / (self.avg_len if self.enable_avg else 1)))
 
+    def get_leak_phase_deg(self):
+        return self.leak_phase_deg
+
+    def set_leak_phase_deg(self, leak_phase_deg):
+        self.leak_phase_deg = leak_phase_deg
+        self.blocks_multiply_const_vxx_0.set_k((10.0 ** (-self.si_isolation_db / 20.0)) * cmath.exp(1j * math.pi * self.leak_phase_deg / 180.0))
+
     def get_loop_bandwidth(self):
         return self.loop_bandwidth
 
@@ -118,5 +127,5 @@ class backscatter_rx_bpsk(gr.hier_block2):
 
     def set_si_isolation_db(self, si_isolation_db):
         self.si_isolation_db = si_isolation_db
-        self.blocks_multiply_const_vxx_0.set_k(-1.0 * (10.0 ** (-self.si_isolation_db / 20.0)))
+        self.blocks_multiply_const_vxx_0.set_k((10.0 ** (-self.si_isolation_db / 20.0)) * cmath.exp(1j * math.pi * self.leak_phase_deg / 180.0))
 
